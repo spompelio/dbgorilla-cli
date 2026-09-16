@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.6.1
+
+### Fixed
+
+- `dbg collector install --provider instaclustr` now connects to the cluster's
+  primary to create the `dbgorilla_monitor` role. It previously used whichever
+  node the cluster API listed first; that API reports the same role for every
+  PostgreSQL node, so on a multi-node cluster the install failed about half the
+  time with `cannot execute CREATE ROLE in a read-only transaction`. The
+  primary is identified by `pg_is_in_recovery()`, as the collector already does
+  during discovery.
+
+- On a cluster created without public addresses, the temporary firewall rule
+  names the address the cluster sees this machine arrive from, rather than its
+  public egress address — which admitted the wrong host and still left setup
+  unable to connect.
+
+### Added
+
+- The install reports where a cluster runs and how it is reachable: the
+  provider account it belongs to, its own VPC, and whether it was created
+  without public addresses. Account residency and address side are independent
+  — a cluster in your own cloud account still has public addresses unless it
+  was created private, and is dialled publicly from outside its VPC.
+
+- A cluster created without public addresses can only be set up from inside its
+  network, so the install checks the route first and says what would make it
+  work — the VPN, a peered VPC, or a bastion — instead of timing out. An
+  unrecognised route warns and continues, because a route out the same
+  interface is indistinguishable from no route at all.
+
 ## v0.6.0
 
 ### Added

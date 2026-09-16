@@ -1588,16 +1588,24 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	// CLI deliberately never stores, so removal is the user's step — but a
 	// silent orphan (the machine's IP allowlisted forever) is not acceptable.
 	if st.InstaclustrClusterID != "" {
-		// A cloud install allowlisted the collector's egress address, a
-		// docker install this machine's — name the right one.
-		if st.IsAWS() || st.IsGCP() {
+		switch {
+		case st.CollectorSecurityGroupID != "":
+			// A VPC-resident collector was allowlisted by security group, so
+			// there is no address left behind — but the entry still grants
+			// whatever now occupies that security group.
+			fmt.Println(style.Warn(fmt.Sprintf(
+				"⚠  The Instaclustr cluster's firewall still allows security group %s.", st.CollectorSecurityGroupID)))
+		case st.IsAWS() || st.IsGCP():
 			fmt.Println(style.Warn("⚠  The Instaclustr cluster's firewall still allows the collector's egress IP."))
-		} else {
+		default:
 			fmt.Println(style.Warn("⚠  The Instaclustr cluster's firewall still allows this machine's IP."))
 		}
-		if st.FirewallRuleID != "" {
+		switch {
+		case st.SecurityGroupRuleID != "":
+			fmt.Printf("   Remove rule %s on the cluster's Firewall Rules page (or via the API).\n", st.SecurityGroupRuleID)
+		case st.FirewallRuleID != "":
 			fmt.Printf("   Remove rule %s on the cluster's Firewall Rules page (or via the API).\n", st.FirewallRuleID)
-		} else {
+		default:
 			fmt.Println("   Review the cluster's Firewall Rules page and remove the entry if no longer wanted.")
 		}
 	}

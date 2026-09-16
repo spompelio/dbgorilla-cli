@@ -83,6 +83,14 @@ type State struct {
 	InstaclustrUsePrivate bool   `json:"instaclustr_use_private,omitempty"`
 	FirewallRuleID        string `json:"firewall_rule_id,omitempty"`
 
+	// A VPC-resident collector is allowlisted by security group instead of by
+	// address, so there is nothing to re-detect when it redeploys.
+	// CollectorSecurityGroupID selects that mode; SecurityGroupRuleID is the
+	// rule the install created, empty when the rule pre-existed so uninstall
+	// never retires an entry it does not own.
+	CollectorSecurityGroupID string `json:"collector_security_group_id,omitempty"`
+	SecurityGroupRuleID      string `json:"security_group_rule_id,omitempty"`
+
 	// gcp target (Region above is shared with aws).
 	Project        string `json:"project,omitempty"`
 	DeploymentName string `json:"deployment_name,omitempty"`

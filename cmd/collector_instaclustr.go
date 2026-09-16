@@ -41,6 +41,8 @@ var (
 	discoverInstaclustr   = collector.DiscoverInstaclustrCluster
 	ensureFirewallRule    = collector.EnsureFirewallRule
 	deleteFirewallRule    = collector.DeleteInstaclustrFirewallRule
+	ensureSGRule          = collector.EnsureSecurityGroupRule
+	removeSGRule          = collector.RemoveSecurityGroupRule
 	createInstaclustrRole = collector.EnsureInstaclustrRole
 	primaryHost           = collector.PrimaryHost
 	privatePathToCluster  = collector.PrivatePathToCluster
@@ -789,6 +791,16 @@ func runRefreshFirewall(cmd *cobra.Command, _ []string) error {
 	}
 	ctx := cmd.Context()
 	allowRaw, _ := cmd.Flags().GetString("allow-ip")
+	// A security-group allowlist keys on the collector's security group rather
+	// than on an address, so a redeploy changes nothing and there is no IP to
+	// re-detect. Reconciling only has to confirm the rule is still present.
+	if st.CollectorSecurityGroupID != "" {
+		if allowRaw != "" {
+			return fmt.Errorf("this collector is allowlisted by security group (%s), so --allow-ip does not apply: "+
+				"its address can change freely without breaking the allowlist", st.CollectorSecurityGroupID)
+		}
+		return refreshSecurityGroupRule(ctx, st, creds)
+	}
 	if allowRaw == "" {
 		switch {
 		case st.IsAWS():
@@ -841,18 +853,59 @@ func runRefreshFirewall(cmd *cobra.Command, _ []string) error {
 			fmt.Println(style.Success("✓ Removed the stale rule from the previous IP"))
 		}
 	}
-	// Record ownership honestly either way: the new rule's id when this run
-	// created it, empty when the current rule pre-existed (the old owned id,
-	// if any, was just retired above and must not linger in state).
-	newID := ""
-	if created {
+	// Record ownership honestly. A refresh that changes nothing re-asserts the
+	// rule we already own and gets created=false back, so ownership has to
+	// survive that — keying off `created` alone made the CLI forget its own
+	// rule on the second run and orphan it at uninstall.
+	newID := st.FirewallRuleID
+	switch {
+	case created:
 		newID = rule.ID
+	case rule.ID != st.FirewallRuleID:
+		// Present under an id we never recorded: the entry pre-existed, and the
+		// id we did own (if any) was retired just above.
+		newID = ""
 	}
 	if st.FirewallRuleID != newID {
 		st.FirewallRuleID = newID
 		if err := collector.SaveState(st); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// refreshSecurityGroupRule reconciles the allowlist entry for a VPC-resident
+// collector.
+//
+// There is nothing to re-detect here, which is the whole point of the
+// security-group primitive: the entry names a security group, and a redeploy
+// that changes the task's address does not touch it. So this only re-asserts
+// the rule if something removed it out of band.
+func refreshSecurityGroupRule(ctx context.Context, st *collector.State, creds collector.InstaclustrCreds) error {
+	rule, created, err := ensureSGRule(ctx, creds, st.InstaclustrClusterID, st.CollectorSecurityGroupID)
+	if err != nil {
+		return err
+	}
+	if created {
+		fmt.Println(style.Success(fmt.Sprintf("✓ Re-allowlisted security group %s", st.CollectorSecurityGroupID)))
+	} else {
+		fmt.Println(style.Success(fmt.Sprintf("✓ Security group %s already allowlisted", st.CollectorSecurityGroupID)))
+	}
+	// Ownership survives a no-op refresh. A rule we created and then re-asserted
+	// comes back as created=false, so keying ownership off `created` alone would
+	// make the CLI forget a rule it owns and leave it behind at uninstall.
+	newID := st.SecurityGroupRuleID
+	switch {
+	case created:
+		newID = rule.ID
+	case rule.ID != st.SecurityGroupRuleID:
+		// Present, but under an id we never recorded: somebody else's rule.
+		newID = ""
+	}
+	if st.SecurityGroupRuleID != newID {
+		st.SecurityGroupRuleID = newID
+		return collector.SaveState(st)
 	}
 	return nil
 }

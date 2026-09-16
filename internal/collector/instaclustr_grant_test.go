@@ -20,15 +20,26 @@ func TestReadAllDataGrantRefusedForLackOfPrivilegeOnlyWarns(t *testing.T) {
 	if fatal {
 		t.Fatal("42501 must not end the install: the role is usable without this grant")
 	}
-	for _, want := range []string{"dbgorilla_monitor", "pg_read_all_data", "SELECT granted on that table"} {
+	for _, want := range []string{"dbgorilla_monitor", "pg_read_all_data", "SELECT"} {
 		if !strings.Contains(warning, want) {
 			t.Fatalf("warning %q does not mention %q", warning, want)
 		}
 	}
-	// The warning must not send an operator hunting a monitoring fault: those
-	// paths are covered by pg_monitor and are genuinely unaffected.
-	if !strings.Contains(warning, "unaffected") {
+	// The warning must not send an operator hunting a monitoring fault: the
+	// statistics views come from pg_monitor and are genuinely unaffected.
+	if !strings.Contains(warning, "Metrics are unaffected") {
 		t.Fatalf("warning %q should say what still works, not just what does not", warning)
+	}
+	// ...and it must not go the other way either. preflight's
+	// CheckTopologyGrants reports the pg_dump topology scrape FAILING without
+	// this exact grant, and on the docker path it prints seconds after this
+	// warning. Claiming topology is unaffected made the two contradict each
+	// other inside a single install.
+	if !strings.Contains(warning, "topology") {
+		t.Fatalf("warning %q should name the topology scrape as what a narrowed role gives up", warning)
+	}
+	if strings.Contains(warning, "topology and schema capture are unaffected") {
+		t.Fatalf("warning %q contradicts preflight's CheckTopologyGrants", warning)
 	}
 }
 

@@ -67,7 +67,7 @@ const instaclustrOwnAccount = "INSTACLUSTR"
 // stands in while a freshly created cluster has not reported an account name
 // yet. Residency says nothing about which addresses to dial: a linked-account
 // cluster keeps public addresses unless PrivateNetworkCluster says otherwise,
-// and the fixture this was built against is exactly that shape.
+// which is why the two are read as independent axes.
 func (t InstaclustrTarget) LinkedAccount() bool {
 	if t.ProviderAccountName != "" {
 		return !strings.EqualFold(t.ProviderAccountName, instaclustrOwnAccount)
@@ -91,6 +91,28 @@ func (n InstaclustrNode) Host(private bool) string {
 	return n.PublicAddress
 }
 
+// icNetworkSettings is a data centre's per-cloud settings block. AWS, GCP and
+// Azure each spell the cluster's own network the same way —
+// customVirtualNetworkId — populated once provisioning creates it and null
+// before that.
+type icNetworkSettings struct {
+	CustomVirtualNetworkID *string `json:"customVirtualNetworkId"`
+}
+
+// customVirtualNetworkID returns the first network id any of the per-cloud
+// settings blocks reports. At most one block is ever populated, so the order
+// of the arguments carries no preference.
+func customVirtualNetworkID(blocks ...[]icNetworkSettings) string {
+	for _, block := range blocks {
+		for _, s := range block {
+			if s.CustomVirtualNetworkID != nil && *s.CustomVirtualNetworkID != "" {
+				return *s.CustomVirtualNetworkID
+			}
+		}
+	}
+	return ""
+}
+
 // instaclustrClusterDetail mirrors the fields this CLI reads from
 // GET /cluster-management/v2/resources/applications/postgresql/clusters/v2/{id}.
 type instaclustrClusterDetail struct {
@@ -107,12 +129,13 @@ type instaclustrClusterDetail struct {
 		// ProviderAccountName is "INSTACLUSTR" on their own accounts and the
 		// customer's provider account name on a linked one.
 		ProviderAccountName *string `json:"providerAccountName"`
-		// AwsSettings carries customVirtualNetworkId — the cluster's VPC,
-		// populated once provisioning creates it and null before that.
-		AwsSettings []struct {
-			CustomVirtualNetworkID *string `json:"customVirtualNetworkId"`
-		} `json:"awsSettings"`
-		Networks []struct {
+		// One settings block per cloud, and the API sends at most one of them.
+		// All three are read, or the VPC would be silently empty on every
+		// cluster that is not on AWS.
+		AwsSettings   []icNetworkSettings `json:"awsSettings"`
+		GcpSettings   []icNetworkSettings `json:"gcpSettings"`
+		AzureSettings []icNetworkSettings `json:"azureSettings"`
+		Networks      []struct {
 			CIDR string `json:"cidr"`
 		} `json:"networks"`
 		// The primary flag lives under the replication block rather than on
@@ -151,11 +174,16 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 	// provider crate reads them the same way. A single-DC cluster may flag no
 	// DC at all, so the first one stands in.
 	if len(detail.DataCentres) > 0 {
+		// FIRST flagged data centre wins. A cluster should flag exactly one, but
+		// without the break a second flag would silently decide the cluster's
+		// cloud, region and network blocks.
 		primary := 0
+	flagged:
 		for i, dc := range detail.DataCentres {
 			for _, r := range dc.InterDataCentreReplication {
 				if r.IsPrimaryDataCentre {
 					primary = i
+					break flagged
 				}
 			}
 		}
@@ -165,12 +193,16 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 		if dc.ProviderAccountName != nil {
 			t.ProviderAccountName = *dc.ProviderAccountName
 		}
-		for _, s := range dc.AwsSettings {
-			if s.CustomVirtualNetworkID != nil && *s.CustomVirtualNetworkID != "" {
-				t.VpcID = *s.CustomVirtualNetworkID
+		// A data centre still being provisioned can report an empty cloud and
+		// region; a sibling that has them is better than rendering a collector
+		// config with neither.
+		for _, other := range detail.DataCentres {
+			if t.CloudProvider != "" {
 				break
 			}
+			t.CloudProvider, t.Region = other.CloudProvider, other.Region
 		}
+		t.VpcID = customVirtualNetworkID(dc.AwsSettings, dc.GcpSettings, dc.AzureSettings)
 		for _, n := range dc.Networks {
 			if n.CIDR != "" {
 				t.NetworkCIDRs = append(t.NetworkCIDRs, n.CIDR)
@@ -264,20 +296,22 @@ func EnsureInstaclustrRole(ctx context.Context, dsn, user, password string) (war
 //
 // Anything else is a real failure.
 //
-// What the warning must NOT claim is that monitoring is degraded. pg_monitor
-// already carries the statistics views, and the only dump this role feeds is
-// `pg_dump --statistics-only`, which reads pg_statistic — so metrics, topology
-// and schema capture are all unaffected. What the grant buys is SELECT on user
-// tables, and the only features that need it are running a query or an EXPLAIN
-// against one. Naming the wrong casualty would send an operator looking for a
-// monitoring fault that isn't there.
+// What the warning must NOT claim is that monitoring is degraded: pg_monitor
+// already carries the statistics views, so metrics are unaffected, and naming
+// the wrong casualty would send an operator looking for a monitoring fault that
+// isn't there. Nor may it claim that everything ELSE is unaffected. The grant
+// buys SELECT on user tables, and preflight's CheckTopologyGrants reports the
+// pg_dump topology scrape failing without exactly that — so the warning names
+// the loss rather than ruling it out, and on the docker path the preflight
+// below measures how many tables it actually costs.
 func classifyReadAllDataGrant(err error, user string) (warning string, fatal bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return "", true
 	}
-	const consequence = "Monitoring, topology and schema capture are unaffected; running a query or an " +
-		"EXPLAIN against a table would need SELECT granted on that table directly."
+	const consequence = "Metrics are unaffected — pg_monitor already carries the statistics views. What the " +
+		"grant buys is SELECT on user tables, so schema and topology capture, and running a query or an " +
+		"EXPLAIN against a table, are what the narrowed role gives up until SELECT is granted directly."
 	switch pgErr.Code {
 	case "42704":
 		return fmt.Sprintf("this server predates the pg_read_all_data role (PostgreSQL 14 introduced it), so %s "+
@@ -314,9 +348,13 @@ var errClusterUnreachable = errors.New("cannot connect to the cluster")
 // timeout or refusal. SQL-level failures are deterministic; retrying them
 // just multiplies the wait before the user sees the real error.
 func RetriableRoleError(err error) bool {
-	if !errors.Is(err, errClusterUnreachable) {
-		return false
-	}
+	return errors.Is(err, errClusterUnreachable) && retriableConnError(err)
+}
+
+// retriableConnError recognizes the shapes a blocked-by-firewall dial takes.
+// Shared by the role step and the primary probe, which face the same latency
+// for the same reason.
+func retriableConnError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") ||
 		strings.Contains(msg, "connection refused") || strings.Contains(msg, "i/o") ||
@@ -452,10 +490,12 @@ func PrimaryHost(ctx context.Context, hosts []string, port int, password string)
 		return hosts[0], nil
 	}
 	attempts := make([]string, 0, len(hosts))
+	unreachable := false
 	for _, h := range hosts {
 		inRecovery, err := hostInRecovery(ctx, h, port, password)
 		if err != nil {
 			attempts = append(attempts, fmt.Sprintf("%s: %v", h, err))
+			unreachable = unreachable || retriableConnError(err)
 			continue
 		}
 		if !inRecovery {
@@ -463,10 +503,35 @@ func PrimaryHost(ctx context.Context, hosts []string, port int, password string)
 		}
 		attempts = append(attempts, h+": standby")
 	}
-	return "", fmt.Errorf("no node answered as the cluster primary — %s. "+
-		"The cluster API reports the same role for every node, so the primary is "+
-		"identified by pg_is_in_recovery(); a cluster mid-failover briefly has none, "+
-		"and re-running is safe", strings.Join(attempts, "; "))
+	return "", &primaryProbeError{
+		msg: fmt.Sprintf("no node answered as the cluster primary — %s. "+
+			"The cluster API reports the same role for every node, so the primary is "+
+			"identified by pg_is_in_recovery(); a cluster mid-failover briefly has none, "+
+			"and re-running is safe", strings.Join(attempts, "; ")),
+		unreachable: unreachable,
+	}
+}
+
+// primaryProbeError carries the aggregate "no primary" failure along with
+// whether any candidate was unreachable, so a caller can retry propagation
+// delay without retrying an answer that is already final.
+type primaryProbeError struct {
+	msg         string
+	unreachable bool
+}
+
+func (e *primaryProbeError) Error() string { return e.msg }
+
+// RetriableProbeError reports whether a PrimaryHost failure is worth another
+// attempt. Only an unreachable node is: a firewall rule created seconds ago
+// may not pass packets yet, and until it does every node looks unreachable
+// rather than simply unelected. A cluster that answered on every node and
+// elected none has given a complete answer — retrying it dials every node
+// again, at connect_timeout each, before showing an error that was already
+// final.
+func RetriableProbeError(err error) bool {
+	var pe *primaryProbeError
+	return errors.As(err, &pe) && pe.unreachable
 }
 
 // localSourceFor returns the local address the OS would send from to reach

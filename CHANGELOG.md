@@ -22,17 +22,26 @@
   PostgreSQL 16 and later require ADMIN OPTION on a role to grant it, and the
   default user holds no membership in it — so the install used to fail at the
   last statement of role setup, having already created a perfectly usable role.
-  It now warns and continues, and says what the role can still do: monitoring,
-  topology and schema capture are unaffected, and only running a query or an
-  EXPLAIN against a table would need SELECT granted on that table directly.
+  It now warns and continues, and says what the narrowed role costs: metrics
+  are unaffected, because `pg_monitor` already carries the statistics views,
+  while schema and topology capture — and running a query or an EXPLAIN against
+  a table — need SELECT on the tables involved.
+
+- `dbg collector refresh-firewall` no longer breaks a collector that dials the
+  cluster's private addresses. It allowlisted this machine's public egress
+  address unconditionally and then retired the recorded rule as stale, which on
+  a private path deleted the entry the collector was connecting through. It now
+  resolves the same address the install did, and refuses to guess when a
+  collector known to be private cannot be resolved.
 
 ### Added
 
 - The install reports where a cluster runs and how it is reachable: the
-  provider account it belongs to, its own VPC, and whether it was created
-  without public addresses. Account residency and address side are independent
-  — a cluster in your own cloud account still has public addresses unless it
-  was created private, and is dialled publicly from outside its VPC.
+  provider account it belongs to, its own VPC, its network blocks, and whether
+  it was created without public addresses. Account residency and address side
+  are independent — a cluster in your own cloud account still has public
+  addresses unless it was created private, and is dialled publicly from outside
+  its VPC. The VPC is read on AWS, GCP and Azure alike.
 
 - A cluster created without public addresses can only be set up from inside its
   network, so the install checks the route first and says what would make it

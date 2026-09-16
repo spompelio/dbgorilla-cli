@@ -70,9 +70,18 @@ type State struct {
 	// operates on; FirewallRuleID is the rule the install created for the
 	// collector's egress IP (empty when the rule pre-existed, so uninstall
 	// never removes an allowlist entry it does not own).
-	InstaclustrClusterID string `json:"instaclustr_cluster_id,omitempty"`
-	InstaclustrUsername  string `json:"instaclustr_username,omitempty"`
-	FirewallRuleID       string `json:"firewall_rule_id,omitempty"`
+	//
+	// UsePrivate records that the install dialled the cluster's private
+	// addresses, so refresh-firewall allowlists this machine's address on the
+	// cluster's network instead of its public egress address — which would
+	// admit the wrong host and then retire the rule the collector is actually
+	// connecting through. A private-network cluster is re-derived from
+	// discovery, so this field only has to carry the case where
+	// --use-private-addresses chose the private side on a public cluster.
+	InstaclustrClusterID  string `json:"instaclustr_cluster_id,omitempty"`
+	InstaclustrUsername   string `json:"instaclustr_username,omitempty"`
+	InstaclustrUsePrivate bool   `json:"instaclustr_use_private,omitempty"`
+	FirewallRuleID        string `json:"firewall_rule_id,omitempty"`
 
 	// gcp target (Region above is shared with aws).
 	Project        string `json:"project,omitempty"`

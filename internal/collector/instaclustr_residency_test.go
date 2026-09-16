@@ -69,25 +69,26 @@ func TestDiscoverReadsResidencyAndNetworkShapeIndependently(t *testing.T) {
 			wantPrivateNet: true,
 		},
 		{
-			// The live BYOC fixture: linked AND public. A cluster in our own
-			// account still gets dialled publicly from outside its VPC.
+			// Linked AND public — the combination the two axes exist to keep
+			// apart. A cluster in the customer's own account still gets dialled
+			// publicly from outside its VPC.
 			name:       "linked account, public addresses",
-			body:       shapeBody("dbgorilla-byoc", "vpc-0ee7a71a1bf660ca3", false),
+			body:       shapeBody("acme-prod", "vpc-linked", false),
 			wantLinked: true,
-			wantVPC:    "vpc-0ee7a71a1bf660ca3",
+			wantVPC:    "vpc-linked",
 		},
 		{
 			name:           "linked account, private network",
-			body:           shapeBody("dbgorilla-byoc", "vpc-0ee7a71a1bf660ca3", true),
+			body:           shapeBody("acme-prod", "vpc-linked", true),
 			wantLinked:     true,
 			wantPrivateNet: true,
-			wantVPC:        "vpc-0ee7a71a1bf660ca3",
+			wantVPC:        "vpc-linked",
 		},
 		{
 			// Mid-provision: the VPC does not exist yet, so the API reports
 			// null for it. The account name still settles residency.
 			name:       "linked account, mid-provision with no VPC yet",
-			body:       shapeBody("dbgorilla-byoc", "", false),
+			body:       shapeBody("acme-prod", "", false),
 			wantLinked: true,
 			wantVPC:    "",
 		},
@@ -115,7 +116,7 @@ func TestDiscoverReadsResidencyAndNetworkShapeIndependently(t *testing.T) {
 // With no account name at all, a reported VPC is the only residency signal
 // left — it stands in rather than defaulting to Instaclustr's account.
 func TestLinkedAccountFallsBackToTheVPCWhenNoAccountNameIsReported(t *testing.T) {
-	got := discoverShape(t, shapeBody("", "vpc-0ee7a71a1bf660ca3", false))
+	got := discoverShape(t, shapeBody("", "vpc-linked", false))
 	if !got.LinkedAccount() {
 		t.Fatal("a reported VPC with no account name should still read as linked")
 	}
@@ -143,7 +144,7 @@ func TestDiscoverReadsResidencyFromThePrimaryDataCentre(t *testing.T) {
     },
     {
       "cloudProvider": "AWS_VPC", "region": "US_EAST_1",
-      "providerAccountName": "dbgorilla-byoc",
+      "providerAccountName": "acme-prod",
       "awsSettings": [{"customVirtualNetworkId": "vpc-primary"}],
       "networks": [{"cidr": "10.10.0.0/16"}],
       "interDataCentreReplication": [{"isPrimaryDataCentre": true}],
@@ -155,7 +156,7 @@ func TestDiscoverReadsResidencyFromThePrimaryDataCentre(t *testing.T) {
 	if got.Region != "US_EAST_1" {
 		t.Fatalf("Region=%q want the primary DC's US_EAST_1", got.Region)
 	}
-	if got.ProviderAccountName != "dbgorilla-byoc" || !got.LinkedAccount() {
+	if got.ProviderAccountName != "acme-prod" || !got.LinkedAccount() {
 		t.Fatalf("residency should come from the primary DC, got %q", got.ProviderAccountName)
 	}
 	if got.VpcID != "vpc-primary" {
@@ -164,5 +165,93 @@ func TestDiscoverReadsResidencyFromThePrimaryDataCentre(t *testing.T) {
 	// Nodes still flatten across every data centre.
 	if len(got.Nodes) != 2 {
 		t.Fatalf("got %d nodes, want both DCs' nodes", len(got.Nodes))
+	}
+}
+
+// A cluster's own network is reported under the settings block of whichever
+// cloud it runs on. Reading only awsSettings left VpcID empty on every GCP and
+// Azure cluster -- and with it LinkedAccount()'s fallback, which is the only
+// residency signal a mid-provision cluster has.
+func TestDiscoverReadsTheVirtualNetworkOnEveryCloud(t *testing.T) {
+	cases := []struct{ name, settings, want string }{
+		{"aws", `"awsSettings": [{"customVirtualNetworkId": "vpc-linked"}]`, "vpc-linked"},
+		{"gcp", `"gcpSettings": [{"customVirtualNetworkId": "projects/p/global/networks/n"}]`, "projects/p/global/networks/n"},
+		{"azure", `"azureSettings": [{"customVirtualNetworkId": "vnet-linked"}]`, "vnet-linked"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := discoverShape(t, fmt.Sprintf(`{
+  "id": "c-1", "name": "orders", "status": "RUNNING",
+  "postgresqlVersion": "18.4.0", "defaultUserPassword": "pw-1",
+  "dataCentres": [{
+    "cloudProvider": "%s", "region": "r-1",
+    "providerAccountName": null,
+    %s,
+    "networks": [{"cidr": "10.10.0.0/16"}],
+    "nodes": [{"id": "n1", "publicAddress": "203.0.113.10"}]
+  }]
+}`, tc.name, tc.settings))
+			if got.VpcID != tc.want {
+				t.Fatalf("VpcID=%q want %q", got.VpcID, tc.want)
+			}
+			// With no account name, the network id is what says "customer's
+			// own account" -- so it has to survive on every cloud, not just AWS.
+			if !got.LinkedAccount() {
+				t.Fatal("a reported network id should read as a linked account")
+			}
+		})
+	}
+}
+
+// The primary flag decides the cluster's cloud, region and network blocks, so
+// a second flagged data centre must not silently take them over.
+func TestDiscoverTakesTheFirstFlaggedPrimaryDataCentre(t *testing.T) {
+	got := discoverShape(t, `{
+  "id": "c-1", "name": "orders", "status": "RUNNING",
+  "postgresqlVersion": "18.4.0", "defaultUserPassword": "pw-1",
+  "dataCentres": [
+    {
+      "cloudProvider": "AWS_VPC", "region": "US_EAST_1",
+      "networks": [{"cidr": "10.10.0.0/16"}],
+      "interDataCentreReplication": [{"isPrimaryDataCentre": true}],
+      "nodes": [{"id": "n1", "publicAddress": "203.0.113.10"}]
+    },
+    {
+      "cloudProvider": "AWS_VPC", "region": "US_WEST_2",
+      "networks": [{"cidr": "10.99.0.0/16"}],
+      "interDataCentreReplication": [{"isPrimaryDataCentre": true}],
+      "nodes": [{"id": "n2", "publicAddress": "203.0.113.20"}]
+    }
+  ]
+}`)
+	if got.Region != "US_EAST_1" {
+		t.Fatalf("Region=%q want the FIRST flagged DC's US_EAST_1", got.Region)
+	}
+	if len(got.NetworkCIDRs) != 1 || got.NetworkCIDRs[0] != "10.10.0.0/16" {
+		t.Fatalf("NetworkCIDRs=%v want the first flagged DC's blocks", got.NetworkCIDRs)
+	}
+}
+
+// A data centre still provisioning can report neither cloud nor region. Those
+// two ride into the collector config verbatim, so a sibling that has them beats
+// rendering the config with neither.
+func TestDiscoverFallsBackToASiblingForAnEmptyCloudAndRegion(t *testing.T) {
+	got := discoverShape(t, `{
+  "id": "c-1", "name": "orders", "status": "PROVISIONING",
+  "postgresqlVersion": "18.4.0", "defaultUserPassword": "pw-1",
+  "dataCentres": [
+    {
+      "cloudProvider": "", "region": "",
+      "interDataCentreReplication": [{"isPrimaryDataCentre": true}],
+      "nodes": [{"id": "n1", "publicAddress": "203.0.113.10"}]
+    },
+    {
+      "cloudProvider": "AWS_VPC", "region": "US_EAST_1",
+      "nodes": [{"id": "n2", "publicAddress": "203.0.113.20"}]
+    }
+  ]
+}`)
+	if got.CloudProvider != "AWS_VPC" || got.Region != "US_EAST_1" {
+		t.Fatalf("cloud/region should fall through to a sibling, got %q/%q", got.CloudProvider, got.Region)
 	}
 }

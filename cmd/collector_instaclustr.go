@@ -42,6 +42,8 @@ var (
 	ensureFirewallRule    = collector.EnsureFirewallRule
 	deleteFirewallRule    = collector.DeleteInstaclustrFirewallRule
 	createInstaclustrRole = collector.EnsureInstaclustrRole
+	primaryHost           = collector.PrimaryHost
+	privatePathToCluster  = collector.PrivatePathToCluster
 	publicEgressIP        = func(ctx context.Context) (string, error) { return collector.PublicEgressIP(ctx) }
 	stackOutput           = collector.StackOutput
 	gcpDeploymentOutput   = collector.GcpDeploymentOutput
@@ -128,14 +130,10 @@ func runInstallInstaclustr(cmd *cobra.Command) error {
 		}
 	} else {
 		// The docker collector runs on this machine, so the rule has to name
-		// the address the cluster sees it arrive from. On a private path that
-		// is this machine's address on the cluster's network; its public
-		// egress address would admit the wrong host and still not connect.
-		ip := ""
-		if in.privateSrc != nil {
-			ip = in.privateSrc.String()
-		} else if ip, err = publicEgressIP(ctx); err != nil {
-			return err
+		// the address the cluster sees it arrive from.
+		ip, ierr := in.sourceIP(ctx)
+		if ierr != nil {
+			return ierr
 		}
 		if allowCIDR, err = collector.AllowCIDR(ip); err != nil {
 			return err
@@ -143,7 +141,7 @@ func runInstallInstaclustr(cmd *cobra.Command) error {
 	}
 
 	if dryRun {
-		return dryRunInstaclustr(cmd, in.ict, in.seedHost, in.databases, in.sslMode, in.setupCreds.Username, in.usePrivate, allowCIDR)
+		return dryRunInstaclustr(cmd, in, allowCIDR)
 	}
 
 	// Firewall: the collector runs on THIS machine for the docker target, so
@@ -219,17 +217,17 @@ func runInstallInstaclustr(cmd *cobra.Command) error {
 	}
 	fmt.Println(style.Success(fmt.Sprintf("✓ Collector provisioned (agent %s, tenant %s)", creds.AgentID, creds.TenantID)))
 
-	comp := collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, caCert, in.setupCreds.Username, in.usePrivate, collector.DBPasswordEnv)
-	cfg := collector.BuildInstaclustr(creds.AgentID, creds.TenantID, comp, endpointsFor(creds, cmd))
+	cfg := collector.BuildInstaclustr(creds.AgentID, creds.TenantID, in.component(collector.DBPasswordEnv), endpointsFor(creds, cmd))
 	rendered, err := cfg.Render()
 	if err != nil {
 		rollbackRule()
 		return err
 	}
 	state := &collector.State{
-		TargetName:           in.ict.Name,
-		InstaclustrClusterID: in.clusterID,
-		InstaclustrUsername:  in.setupCreds.Username,
+		TargetName:            in.ict.Name,
+		InstaclustrClusterID:  in.clusterID,
+		InstaclustrUsername:   in.setupCreds.Username,
+		InstaclustrUsePrivate: in.usePrivate,
 	}
 	if created {
 		state.FirewallRuleID = rule.ID
@@ -262,6 +260,26 @@ type instaclustrInstall struct {
 	// the public path, where the operator's public egress address is used
 	// instead.
 	privateSrc net.IP
+}
+
+// sourceIP is the address the cluster sees this machine arrive from: on a
+// private path this machine's address on the cluster's network, and its public
+// egress address otherwise. The one place that decides — allowlisting the
+// public address on a private path admits the wrong host AND leaves setup
+// unable to connect, so the two callers must never drift apart.
+func (in *instaclustrInstall) sourceIP(ctx context.Context) (string, error) {
+	if in.privateSrc != nil {
+		return in.privateSrc.String(), nil
+	}
+	return publicEgressIP(ctx)
+}
+
+// component renders the [component] block for this install. passwordEnv names
+// the password variable of the deploy substrate. Called after the primary is
+// resolved, so it reads whatever in.seedHost has settled on.
+func (in *instaclustrInstall) component(passwordEnv string) collector.Component {
+	return collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
+		in.setupCreds.Username, in.usePrivate, passwordEnv)
 }
 
 // resolveInstaclustrInstallInputs gathers everything the substrates share:
@@ -343,20 +361,30 @@ func resolveInstaclustrInstallInputs(cmd *cobra.Command, apiURL string, dryRun b
 	// the temporary firewall rule is rolled back either way.
 	var privateSrc net.IP
 	if usePrivate {
-		src, how, ok := collector.PrivatePathToCluster(ict.NetworkCIDRs)
+		src, how, ok := privatePathToCluster(ict.NetworkCIDRs)
 		privateSrc = src
-		where := "the cluster's network"
-		if len(ict.NetworkCIDRs) > 0 {
-			where = strings.Join(ict.NetworkCIDRs, ", ")
+		// A dry run makes no connection, so the warning must not promise that
+		// one will settle the question.
+		arbiter := "Continuing, because a route out the same interface looks identical from here; the " +
+			"connection will settle it."
+		if dryRun {
+			arbiter = "A dry run connects to nothing, so the check stops here; the real install lets the " +
+				"connection settle it."
 		}
-		if ok {
+		reach := fmt.Sprintf("Setup connects to %s:5432 to create the %s role, so it has to run on that "+
+			"network — on the VPN, from a peered VPC, or a bastion inside the cluster's VPC.",
+			seedHost, collector.InstaclustrMonitorUser)
+		switch {
+		case ok:
 			fmt.Println(style.Success(fmt.Sprintf("✓ Private path to the cluster: %s", how)))
-		} else {
-			fmt.Println(style.Warn(fmt.Sprintf("⚠  No route to %s was recognised from this machine, and this "+
-				"cluster has no public addresses. Setup connects to %s:5432 to create the %s role, so it has to run "+
-				"on that network — on the VPN, from a peered VPC, or a bastion inside the cluster's VPC. Continuing, "+
-				"because a route out the same interface looks identical from here; the connection will settle it.",
-				where, seedHost, collector.InstaclustrMonitorUser)))
+		case len(ict.NetworkCIDRs) == 0:
+			// Nothing was probed, so nothing was learned. Reporting this as an
+			// unrecognised route would claim a check that never ran.
+			fmt.Println(style.Warn(fmt.Sprintf("⚠  This cluster reports no network blocks, so the route to it "+
+				"could not be checked from this machine. %s %s", reach, arbiter)))
+		default:
+			fmt.Println(style.Warn(fmt.Sprintf("⚠  No route to %s was recognised from this machine. %s %s",
+				strings.Join(ict.NetworkCIDRs, ", "), reach, arbiter)))
 		}
 	}
 
@@ -385,13 +413,8 @@ func resolveInstaclustrInstallInputs(cmd *cobra.Command, apiURL string, dryRun b
 // remover — which every later exit path must call, unless the temporary rule
 // turns out to be the collector's own.
 func setupMonitoringRole(ctx context.Context, in *instaclustrInstall, monitorPassword string) (opRule collector.FirewallRule, opCreated bool, removeOperatorRule func(), err error) {
-	// On a private path the cluster sees this machine arrive on that network,
-	// so allowlisting its public egress address would admit the wrong host
-	// and still leave setup unable to connect.
-	operatorIP := ""
-	if in.privateSrc != nil {
-		operatorIP = in.privateSrc.String()
-	} else if operatorIP, err = publicEgressIP(ctx); err != nil {
+	operatorIP, err := in.sourceIP(ctx)
+	if err != nil {
 		return collector.FirewallRule{}, false, nil, err
 	}
 	operatorCIDR, err := collector.AllowCIDR(operatorIP)
@@ -481,16 +504,21 @@ func allowlistCollectorEgress(ctx context.Context, in *instaclustrInstall, stabl
 // remote call already made is the read-only cluster GET. It prints what the
 // real run would do — the firewall rule, the role SQL (with a placeholder
 // password), the rendered config, and the container command.
-func dryRunInstaclustr(cmd *cobra.Command, ict collector.InstaclustrTarget, seedHost string, databases []string, sslMode, apiUsername string, usePrivate bool, allowCIDR string) error {
+func dryRunInstaclustr(cmd *cobra.Command, in *instaclustrInstall, allowCIDR string) error {
 	fmt.Println(style.Info("Dry run: nothing will be minted, written, allowlisted, or started."))
 	fmt.Println()
 	fmt.Printf("Would allowlist on the cluster firewall:  %s (POSTGRESQL)\n", allowCIDR)
 	fmt.Printf("Would ensure role via the default user:   %s\n", collector.InstaclustrMonitorUser)
 	fmt.Println("  CREATE ROLE " + collector.InstaclustrMonitorUser + " LOGIN PASSWORD '<generated>'")
 	fmt.Println("  GRANT pg_monitor TO " + collector.InstaclustrMonitorUser)
-	fmt.Println("  GRANT pg_read_all_data TO " + collector.InstaclustrMonitorUser)
+	// Named as expected-to-fail rather than dropped: the statement IS attempted,
+	// and a managed cluster's default user holds no ADMIN OPTION on
+	// pg_read_all_data, so a preview that showed it succeeding would disagree
+	// with every real install.
+	fmt.Println("  GRANT pg_read_all_data TO " + collector.InstaclustrMonitorUser +
+		"   # refused on a managed cluster; the install reports the narrowed role and continues")
 	fmt.Println()
-	comp := collector.BuildInstaclustrComponent(ict, seedHost, 5432, databases, sslMode, "", apiUsername, usePrivate, collector.DBPasswordEnv)
+	comp := in.component(collector.DBPasswordEnv)
 	// Empty credentials: nothing is minted on a dry run, so the endpoints are
 	// whatever the --*-url flags say (or the collector's production defaults).
 	cfg := collector.BuildInstaclustr("<agent-id>", "<tenant-id>", comp, endpointsFor(&api.CollectorCredentials{}, cmd))
@@ -500,6 +528,7 @@ func dryRunInstaclustr(cmd *cobra.Command, ict collector.InstaclustrTarget, seed
 	}
 	fmt.Println("Would write collector.toml:")
 	fmt.Println(rendered)
+	printProvisionalSeedHost(in)
 	image, imageSource := resolveImage(cmd, nil)
 	runner := collector.Runner{
 		Name:  collector.DefaultContainerName,
@@ -507,6 +536,24 @@ func dryRunInstaclustr(cmd *cobra.Command, ict collector.InstaclustrTarget, seed
 	}
 	fmt.Printf("Would run (%s): %s\n", imageSource, runner.RunCommandString())
 	return nil
+}
+
+// printProvisionalSeedHost warns that a previewed connect.host may not be the
+// one the install writes.
+//
+// The primary is settled by asking each node pg_is_in_recovery(), which needs a
+// connection, which needs the temporary firewall rule a dry run must not
+// create. So the preview can only show the first-listed node — and the cluster
+// API lists a standby first about as often as not. Saying so is the honest
+// version of a preview whose whole purpose is to rule out surprises.
+func printProvisionalSeedHost(in *instaclustrInstall) {
+	if len(in.ict.Nodes) < 2 {
+		return
+	}
+	fmt.Println(style.Warn(fmt.Sprintf("⚠  connect.host above is %s, the first node the cluster API lists. "+
+		"The install settles the real primary with pg_is_in_recovery() once the firewall rule is up, and writes "+
+		"that address instead — this cluster has %d nodes, and the ordering carries no meaning.",
+		in.seedHost, len(in.ict.Nodes))))
 }
 
 // ensureRoleWithRetry absorbs firewall-propagation latency: a rule created
@@ -569,11 +616,14 @@ func describeInstaclustrShape(ict collector.InstaclustrTarget, usePrivate bool) 
 		side = "private"
 	}
 	out := fmt.Sprintf("Runs in %s on %s — dialling %s addresses", residency, network, side)
+	// The network blocks do not depend on a VPC id being reported: a
+	// private-network cluster in Instaclustr's own account has blocks and no
+	// VPC id, and those are exactly the clusters whose route warning names them.
 	if ict.VpcID != "" {
 		out += fmt.Sprintf("; VPC %s", ict.VpcID)
-		if len(ict.NetworkCIDRs) > 0 {
-			out += " " + strings.Join(ict.NetworkCIDRs, ", ")
-		}
+	}
+	if len(ict.NetworkCIDRs) > 0 {
+		out += "; network " + strings.Join(ict.NetworkCIDRs, ", ")
 	}
 	return out
 }
@@ -583,9 +633,12 @@ func describeInstaclustrShape(ict collector.InstaclustrTarget, usePrivate bool) 
 // gathering inputs. It has to run after the operator's firewall rule exists,
 // because it connects to the cluster to ask.
 //
-// Retries match ensureRoleWithRetry: a freshly created firewall rule takes a
-// moment to pass packets, and until it does every node looks unreachable
-// rather than simply unelected.
+// Retries match ensureRoleWithRetry, gate included: a freshly created firewall
+// rule takes a moment to pass packets, and until it does every node looks
+// unreachable rather than simply unelected. But a cluster that answered on
+// every node and elected none is a complete, actionable answer — retrying it
+// dials every node three more times, at connect_timeout each, before showing
+// the operator an error that was already final.
 func resolveSeedPrimary(ctx context.Context, in *instaclustrInstall) error {
 	hosts := make([]string, 0, len(in.ict.Nodes))
 	for _, n := range in.ict.Nodes {
@@ -605,8 +658,11 @@ func resolveSeedPrimary(ctx context.Context, in *instaclustrInstall) error {
 			case <-time.After(8 * time.Second):
 			}
 		}
-		if primary, err = collector.PrimaryHost(ctx, hosts, 5432, in.ict.DefaultUserPassword); err == nil {
+		if primary, err = primaryHost(ctx, hosts, 5432, in.ict.DefaultUserPassword); err == nil {
 			break
+		}
+		if !collector.RetriableProbeError(err) {
+			return err
 		}
 	}
 	if err != nil {
@@ -666,6 +722,47 @@ func resolveInstaclustrKey(cmd *cobra.Command, flag, env, label string) (string,
 
 // --- refresh-firewall ------------------------------------------------------
 
+// refreshSourceIP answers the same question install's sourceIP does, for a
+// machine whose install has already finished: which address does the cluster
+// see this collector arrive from.
+//
+// The private side is re-derived rather than trusted to state alone, so an
+// install that predates the recorded flag — or a cluster made private
+// afterwards — is still handled. Discovery is the read-only cluster GET
+// refresh-firewall's credentials already allow.
+func refreshSourceIP(ctx context.Context, creds collector.InstaclustrCreds, st *collector.State) (string, error) {
+	ict, derr := discoverInstaclustr(ctx, creds, st.InstaclustrClusterID)
+	switch {
+	case derr != nil && st.InstaclustrUsePrivate:
+		// Known to be private and undescribable: guessing the public address
+		// here would allowlist the wrong host and retire the working rule.
+		return "", fmt.Errorf("this collector dials the cluster's private addresses, so the firewall rule has "+
+			"to name this machine's address on the cluster's network — and the cluster could not be described "+
+			"to work out which that is: %w\n\nPass --allow-ip to set it explicitly", derr)
+	case derr != nil:
+		// Discovery is an improvement to this command, not a new requirement
+		// for it: a cluster the API cannot describe right now still refreshes
+		// against the public address, exactly as it always did.
+		return publicEgressIP(ctx)
+	case !st.InstaclustrUsePrivate && !ict.PrivateNetworkCluster:
+		return publicEgressIP(ctx)
+	}
+	src, how, ok := privatePathToCluster(ict.NetworkCIDRs)
+	if src == nil {
+		// Nothing to go on: no network blocks, or no route to any of them. The
+		// public address is still the better guess than no rule at all, and it
+		// is what the install fell back to in the same position.
+		fmt.Println(style.Warn("⚠  This collector dials the cluster's private addresses, but no route to the " +
+			"cluster's network could be resolved from this machine. Allowlisting the public egress address " +
+			"instead — pass --allow-ip if the cluster sees this collector arrive from somewhere else."))
+		return publicEgressIP(ctx)
+	}
+	if ok {
+		fmt.Println(style.Success(fmt.Sprintf("✓ Private path to the cluster: %s", how)))
+	}
+	return src.String(), nil
+}
+
 var refreshFirewallCmd = &cobra.Command{
 	Use:   "refresh-firewall",
 	Short: "Re-allowlist the collector's current IP on the Instaclustr cluster firewall",
@@ -710,7 +807,13 @@ func runRefreshFirewall(cmd *cobra.Command, _ []string) error {
 				return fmt.Errorf("%w\n\nPass --allow-ip explicitly for a deploy without stable egress", err)
 			}
 		default:
-			allowRaw, err = publicEgressIP(ctx)
+			// The docker collector runs on THIS machine, so the rule has to
+			// name the address the cluster sees it arrive from — which on a
+			// private path is this machine's address on the cluster's network,
+			// not its public egress. Getting this wrong is not a no-op: the
+			// stale-rule retirement below would then delete the very rule the
+			// collector is connecting through.
+			allowRaw, err = refreshSourceIP(ctx, creds, st)
 			if err != nil {
 				return err
 			}
@@ -841,12 +944,9 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	if assignIP == "" {
 		assignIP = "ENABLED"
 	}
-	comp := collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
-		in.setupCreds.Username, in.usePrivate, collector.CloudDBPasswordEnv)
 	input := collector.AwsStackInput{
 		Region:          region,
 		AccountID:       accountID,
-		Components:      []collector.Component{comp},
 		Subnets:         subnets,
 		SecurityGroup:   sg,
 		AssignPublicIP:  assignIP,
@@ -857,6 +957,10 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	}
 
 	if dryRun {
+		// The primary is settled by connecting to the cluster, which needs the
+		// firewall rule a dry run must not create — so the preview renders the
+		// provisional seed host and says so.
+		input.Components = []collector.Component{in.component(collector.CloudDBPasswordEnv)}
 		input.AgentID, input.TenantID, input.Image = "<agent-id>", "<tenant-id>", "<image>"
 		params, secrets, err := collector.AwsStackParams(input)
 		if err != nil {
@@ -864,23 +968,20 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 		}
 		fmt.Printf("\nDry run — validating the template for stack %q (no identity minted, no firewall or role changes):\n", stackName)
 		printAwsParams(params, secrets)
+		printProvisionalSeedHost(in)
 		return runFargateDeploy(collector.FargateDeploy{
 			StackName: stackName, Params: params, Secrets: secrets, DryRun: true, TemplateURL: templateURL,
 		})
 	}
 
-	// Role first, through the operator's temporary firewall entry.
+	// Role first, through the operator's temporary firewall entry — which is
+	// also what settles the primary, so the component is built afterwards, on
+	// the address the collector should actually seed from.
 	opRule, opCreated, removeOperatorRule, err := setupMonitoringRole(ctx, in, monitorPassword)
 	if err != nil {
 		return err
 	}
-	// The component above was rendered against the first-listed node; setup
-	// has since resolved the real primary, so render it again on the address
-	// the collector should seed from.
-	input.Components = []collector.Component{
-		collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
-			in.setupCreds.Username, in.usePrivate, collector.CloudDBPasswordEnv),
-	}
+	input.Components = []collector.Component{in.component(collector.CloudDBPasswordEnv)}
 
 	fmt.Println(style.Info("Provisioning collector identity..."))
 	creds, err := in.client.ProvisionCollector()
@@ -908,17 +1009,18 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	// Save state BEFORE the slow deploy (the aws pattern): an interrupted
 	// install leaves a tracked collector, not an orphaned stack + identity.
 	saveStateOrWarn(&collector.State{
-		AgentID:              creds.AgentID,
-		TenantID:             creds.TenantID,
-		Domain:               creds.Domain,
-		Target:               "aws",
-		Image:                image,
-		TargetName:           in.ict.Name,
-		StackName:            stackName,
-		Region:               region,
-		InstaclustrClusterID: in.clusterID,
-		InstaclustrUsername:  in.setupCreds.Username,
-		CreatedAt:            time.Now().UTC(),
+		AgentID:               creds.AgentID,
+		TenantID:              creds.TenantID,
+		Domain:                creds.Domain,
+		Target:                "aws",
+		Image:                 image,
+		TargetName:            in.ict.Name,
+		StackName:             stackName,
+		Region:                region,
+		InstaclustrClusterID:  in.clusterID,
+		InstaclustrUsername:   in.setupCreds.Username,
+		InstaclustrUsePrivate: in.usePrivate,
+		CreatedAt:             time.Now().UTC(),
 	})
 
 	fmt.Printf("Deploying to Fargate (stack %q)...\n", stackName)
@@ -1091,10 +1193,7 @@ func runInstallInstaclustrGCP(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	comp := collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
-		in.setupCreds.Username, in.usePrivate, collector.CloudDBPasswordEnv)
 	input := collector.GcpStackInput{
-		Components:      []collector.Component{comp},
 		Network:         network,
 		Subnetwork:      subnetwork,
 		Region:          region,
@@ -1106,6 +1205,10 @@ func runInstallInstaclustrGCP(cmd *cobra.Command) error {
 	}
 
 	if dryRun {
+		// The primary is settled by connecting to the cluster, which needs the
+		// firewall rule a dry run must not create — so the preview renders the
+		// provisional seed host and says so.
+		input.Components = []collector.Component{in.component(collector.CloudDBPasswordEnv)}
 		input.AgentID, input.TenantID, input.Image = "<agent-id>", "<tenant-id>", "<image>"
 		inputs, err := collector.GcpDeployInputs(input)
 		if err != nil {
@@ -1114,24 +1217,21 @@ func runInstallInstaclustrGCP(cmd *cobra.Command) error {
 		fmt.Printf("\nDry run — probing the template for deployment %q (no identity minted, no secrets written, no firewall or role changes):\n", deploymentName)
 		printDeployParams(inputs, nil, "collector_config")
 		printGcpSecretPlan(deploymentName)
+		printProvisionalSeedHost(in)
 		return runGcpDeploy(collector.GcpDeploy{
 			Project: project, Region: region, DeploymentName: deploymentName,
 			TemplateSource: templateSource, DryRun: true,
 		})
 	}
 
-	// Role first, through the operator's temporary firewall entry.
+	// Role first, through the operator's temporary firewall entry — which is
+	// also what settles the primary, so the component is built afterwards, on
+	// the address the collector should actually seed from.
 	opRule, opCreated, removeOperatorRule, err := setupMonitoringRole(ctx, in, monitorPassword)
 	if err != nil {
 		return err
 	}
-	// The component above was rendered against the first-listed node; setup
-	// has since resolved the real primary, so render it again on the address
-	// the collector should seed from.
-	input.Components = []collector.Component{
-		collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
-			in.setupCreds.Username, in.usePrivate, collector.CloudDBPasswordEnv),
-	}
+	input.Components = []collector.Component{in.component(collector.CloudDBPasswordEnv)}
 
 	fmt.Println(style.Info("Provisioning collector identity..."))
 	creds, err := in.client.ProvisionCollector()
@@ -1172,18 +1272,19 @@ func runInstallInstaclustrGCP(cmd *cobra.Command) error {
 	// Save state BEFORE the slow deploy (the aws pattern): an interrupted
 	// install leaves a tracked collector, not an orphaned deployment + identity.
 	saveStateOrWarn(&collector.State{
-		AgentID:              creds.AgentID,
-		TenantID:             creds.TenantID,
-		Domain:               creds.Domain,
-		Target:               "gcp",
-		Image:                image,
-		TargetName:           in.ict.Name,
-		Project:              project,
-		Region:               region,
-		DeploymentName:       deploymentName,
-		InstaclustrClusterID: in.clusterID,
-		InstaclustrUsername:  in.setupCreds.Username,
-		CreatedAt:            time.Now().UTC(),
+		AgentID:               creds.AgentID,
+		TenantID:              creds.TenantID,
+		Domain:                creds.Domain,
+		Target:                "gcp",
+		Image:                 image,
+		TargetName:            in.ict.Name,
+		Project:               project,
+		Region:                region,
+		DeploymentName:        deploymentName,
+		InstaclustrClusterID:  in.clusterID,
+		InstaclustrUsername:   in.setupCreds.Username,
+		InstaclustrUsePrivate: in.usePrivate,
+		CreatedAt:             time.Now().UTC(),
 	})
 
 	fmt.Printf("Deploying to Compute Engine (deployment %q)...\n", deploymentName)

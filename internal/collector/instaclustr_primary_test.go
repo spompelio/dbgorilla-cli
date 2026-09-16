@@ -116,3 +116,35 @@ func TestPrimaryHostRefusesAnEmptyCandidateList(t *testing.T) {
 		t.Fatal("expected an error with no candidates")
 	}
 }
+
+// Retrying costs a full dial of every node at connect_timeout each, so it has
+// to be reserved for the failure a retry can actually fix: a firewall rule that
+// has not started passing packets yet.
+func TestRetriableProbeErrorOnlyCoversAnUnreachableNode(t *testing.T) {
+	// Every node answered, and answered "standby" -- a complete answer. A
+	// cluster mid-failover is re-run by the operator, not re-dialled in a loop.
+	stubRecovery(t, map[string]bool{"10.0.0.1": true, "10.0.0.2": true})
+	_, err := PrimaryHost(context.Background(), []string{"10.0.0.1", "10.0.0.2"}, 5432, "pw")
+	if err == nil {
+		t.Fatal("a cluster with no writer should fail")
+	}
+	if RetriableProbeError(err) {
+		t.Fatal("an all-standby answer is deterministic; retrying it only delays the real error")
+	}
+
+	// One node unreachable: the firewall rule may simply not be live yet.
+	stubRecovery(t, map[string]bool{"10.0.0.1": true})
+	_, err = PrimaryHost(context.Background(), []string{"10.0.0.1", "10.0.0.2"}, 5432, "pw")
+	if err == nil {
+		t.Fatal("an unreachable node with no writer should fail")
+	}
+	if !RetriableProbeError(err) {
+		t.Fatalf("an unreachable node is worth another attempt: %v", err)
+	}
+
+	// Nothing to probe at all is a caller error, not a propagation delay.
+	_, err = PrimaryHost(context.Background(), nil, 5432, "pw")
+	if err == nil || RetriableProbeError(err) {
+		t.Fatalf("no candidates is deterministic, got %v", err)
+	}
+}

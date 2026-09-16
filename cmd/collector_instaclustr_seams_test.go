@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -63,6 +64,41 @@ func stubPublicEgressIP(t *testing.T, ip string, err error) {
 	orig := publicEgressIP
 	publicEgressIP = func(_ context.Context) (string, error) { return ip, err }
 	t.Cleanup(func() { publicEgressIP = orig })
+}
+
+func stubPrimaryHost(t *testing.T, host string, err error) *[][]string {
+	t.Helper()
+	var probed [][]string
+	orig := primaryHost
+	primaryHost = func(_ context.Context, hosts []string, _ int, _ string) (string, error) {
+		probed = append(probed, hosts)
+		return host, err
+	}
+	t.Cleanup(func() { primaryHost = orig })
+	return &probed
+}
+
+func stubPrivatePathToCluster(t *testing.T, src net.IP, how string, ok bool) {
+	t.Helper()
+	orig := privatePathToCluster
+	privatePathToCluster = func([]string) (net.IP, string, bool) { return src, how, ok }
+	t.Cleanup(func() { privatePathToCluster = orig })
+}
+
+// icTestPrivateTarget is a private-network cluster: two nodes, no public
+// addresses, and the network blocks the route check reads.
+func icTestPrivateTarget() collector.InstaclustrTarget {
+	return collector.InstaclustrTarget{
+		ClusterID: "c-1", Name: "orders", Status: "RUNNING",
+		PostgresVersion: "18.4.0", CloudProvider: "AWS_VPC", Region: "US_EAST_1",
+		DefaultUserPassword:   "pw-1",
+		PrivateNetworkCluster: true,
+		NetworkCIDRs:          []string{"10.10.0.0/16"},
+		Nodes: []collector.InstaclustrNode{
+			{ID: "n1", PrivateAddress: "10.10.3.1"},
+			{ID: "n2", PrivateAddress: "10.10.3.2"},
+		},
+	}
 }
 
 func icTestTarget() collector.InstaclustrTarget {
@@ -440,6 +476,95 @@ func TestInstallInstaclustrAWSHappyPath(t *testing.T) {
 	}
 }
 
+// The whole point of the primary probe: the cluster API lists a standby first
+// about as often as not, and BOTH the role writes and the rendered
+// collector.toml have to land on the node the probe elected -- not on the one
+// the listing happened to put first.
+func TestInstallSeedsFromTheProbedPrimaryNotTheFirstListedNode(t *testing.T) {
+	isolate(t)
+	writeTokens(t)
+	srv := installServer(t, "a-1")
+	defer srv.Close()
+	setInstallStubs(t, nil, cleanReport(), nil)
+
+	target := icTestTarget()
+	// Replica first, primary second -- the ordering that broke the install.
+	target.Nodes = []collector.InstaclustrNode{
+		{ID: "n1", PublicAddress: "203.0.113.10", PrivateAddress: "10.0.0.10"},
+		{ID: "n2", PublicAddress: "203.0.113.11", PrivateAddress: "10.0.0.11"},
+	}
+	stubDiscoverInstaclustr(t, target, nil)
+	stubPublicEgressIP(t, "192.0.2.9", nil)
+	stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-1", Network: "192.0.2.9/32"}, true, nil)
+	roleRuns := stubCreateInstaclustrRole(t, nil)
+	probed := stubPrimaryHost(t, "203.0.113.11", nil)
+
+	cmd := icCmd(t, srv.URL)
+	mustSet(t, cmd, "cluster-id", "c-1")
+	mustSet(t, cmd, "instaclustr-user", "someone")
+	mustSet(t, cmd, "instaclustr-api-key", "key123")
+	mustSet(t, cmd, "instaclustr-readonly-key", "key456")
+
+	if err := runInstall(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(*probed) != 1 || len((*probed)[0]) != 2 || (*probed)[0][0] != "203.0.113.10" {
+		t.Fatalf("every node should have been offered to the probe, got %v", *probed)
+	}
+	if len(*roleRuns) != 1 || !strings.Contains((*roleRuns)[0], "@203.0.113.11:5432") {
+		t.Fatalf("role writes went somewhere other than the elected primary: %v", *roleRuns)
+	}
+	st, err := collector.LoadState()
+	if err != nil || st == nil {
+		t.Fatalf("no state saved: %v", err)
+	}
+	cfg, err := collector.LoadConfig(st.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Component[0].Connect.Host; got != "203.0.113.11" {
+		t.Fatalf("collector.toml seeds from %q, not the elected primary 203.0.113.11", got)
+	}
+}
+
+// A deterministic probe failure -- every node reachable, none of them a writer
+// -- must surface immediately. Retrying it re-dials every node at
+// connect_timeout each, adding minutes before an answer that was already final.
+func TestInstallDoesNotRetryADeterministicPrimaryProbeFailure(t *testing.T) {
+	isolate(t)
+	writeTokens(t)
+	srv := installServer(t, "a-1")
+	defer srv.Close()
+	setInstallStubs(t, nil, cleanReport(), nil)
+
+	target := icTestTarget()
+	target.Nodes = []collector.InstaclustrNode{
+		{ID: "n1", PublicAddress: "203.0.113.10"},
+		{ID: "n2", PublicAddress: "203.0.113.11"},
+	}
+	stubDiscoverInstaclustr(t, target, nil)
+	stubPublicEgressIP(t, "192.0.2.9", nil)
+	stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-1", Network: "192.0.2.9/32"}, true, nil)
+	stubDeleteFirewallRule(t, nil)
+	stubCreateInstaclustrRole(t, errors.New("must not be reached"))
+	// Not a connection failure: the cluster answered, and answered "standby".
+	probed := stubPrimaryHost(t, "", errors.New("no node answered as the cluster primary"))
+
+	cmd := icCmd(t, srv.URL)
+	mustSet(t, cmd, "cluster-id", "c-1")
+	mustSet(t, cmd, "instaclustr-user", "someone")
+	mustSet(t, cmd, "instaclustr-api-key", "key123")
+	mustSet(t, cmd, "instaclustr-readonly-key", "key456")
+
+	if err := runInstall(cmd, nil); err == nil {
+		t.Fatal("expected the install to fail when no node is the primary")
+	}
+	if len(*probed) != 1 {
+		t.Fatalf("a deterministic probe failure was retried %d times", len(*probed))
+	}
+}
+
 func TestRefreshFirewallOnAWSUsesTheStackEgressIP(t *testing.T) {
 	isolate(t)
 	if err := collector.SaveState(&collector.State{
@@ -483,6 +608,7 @@ func TestRefreshFirewallRotatesTheRule(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, icTestTarget(), nil)
 	stubPublicEgressIP(t, "192.0.2.9", nil)
 	cidrs := stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-new", Network: "192.0.2.9/32"}, true, nil)
 	deleted := stubDeleteFirewallRule(t, nil)
@@ -513,6 +639,7 @@ func TestRefreshFirewallNeverDeletesARuleItDoesNotOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, icTestTarget(), nil)
 	stubPublicEgressIP(t, "192.0.2.9", nil)
 	stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-x", Network: "192.0.2.9/32"}, false, nil)
 	deleted := stubDeleteFirewallRule(t, errors.New("must not be called"))
@@ -522,6 +649,112 @@ func TestRefreshFirewallNeverDeletesARuleItDoesNotOwn(t *testing.T) {
 	}
 	if len(*deleted) != 0 {
 		t.Fatalf("deleted a rule the CLI does not own: %v", *deleted)
+	}
+}
+
+// A private-path install allowlists this machine's address ON THE CLUSTER'S
+// NETWORK. refresh-firewall has to reach the same answer, or it allowlists the
+// public egress address and then deletes the rule the collector is actually
+// connecting through -- taking the collector down rather than keeping it up.
+func TestRefreshFirewallOnAPrivateClusterKeepsThePrivateSource(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID:               "a-1",
+		InstaclustrClusterID:  "c-1",
+		InstaclustrUsername:   "someone",
+		InstaclustrUsePrivate: true,
+		FirewallRuleID:        "r-private",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, icTestPrivateTarget(), nil)
+	stubPrivatePathToCluster(t, net.ParseIP("10.10.9.9"), "this machine holds 10.10.9.9 inside 10.10.0.0/16", true)
+	stubPublicEgressIP(t, "203.0.113.5", errors.New("must not be called on a private path"))
+	cidrs := stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-private", Network: "10.10.9.9/32"}, false, nil)
+	deleted := stubDeleteFirewallRule(t, errors.New("must not retire the collector's own rule"))
+
+	if err := runRefreshFirewall(refreshFirewallCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(*cidrs) != 1 || (*cidrs)[0] != "10.10.9.9/32" {
+		t.Fatalf("expected the private source address, got %v", *cidrs)
+	}
+	if len(*deleted) != 0 {
+		t.Fatalf("refresh deleted the rule the collector connects through: %v", *deleted)
+	}
+}
+
+// A cluster created private AFTER the install predates the recorded flag, so
+// discovery -- not state alone -- has to settle the address side.
+func TestRefreshFirewallReadsThePrivateSideFromDiscovery(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID:              "a-1",
+		InstaclustrClusterID: "c-1",
+		InstaclustrUsername:  "someone",
+		// No InstaclustrUsePrivate: this install predates the field.
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, icTestPrivateTarget(), nil)
+	stubPrivatePathToCluster(t, net.ParseIP("10.10.9.9"), "", false)
+	stubPublicEgressIP(t, "203.0.113.5", errors.New("must not be called for a private-network cluster"))
+	cidrs := stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-1", Network: "10.10.9.9/32"}, false, nil)
+
+	if err := runRefreshFirewall(refreshFirewallCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(*cidrs) != 1 || (*cidrs)[0] != "10.10.9.9/32" {
+		t.Fatalf("expected the private source address, got %v", *cidrs)
+	}
+}
+
+// Discovery is an improvement to refresh-firewall, not a new requirement: a
+// public install whose cluster cannot be described right now still refreshes.
+func TestRefreshFirewallFallsBackToPublicEgressWhenDiscoveryFails(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID:              "a-1",
+		InstaclustrClusterID: "c-1",
+		InstaclustrUsername:  "someone",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, collector.InstaclustrTarget{}, errors.New("cluster management API unavailable"))
+	stubPublicEgressIP(t, "192.0.2.9", nil)
+	cidrs := stubEnsureFirewallRule(t, collector.FirewallRule{ID: "r-1", Network: "192.0.2.9/32"}, false, nil)
+
+	if err := runRefreshFirewall(refreshFirewallCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(*cidrs) != 1 || (*cidrs)[0] != "192.0.2.9/32" {
+		t.Fatalf("expected the public egress address, got %v", *cidrs)
+	}
+}
+
+// ...but a collector KNOWN to dial privately must not be handed the public
+// address as a guess: that allowlists the wrong host and retires the right rule.
+func TestRefreshFirewallRefusesToGuessWhenAPrivateClusterCannotBeDescribed(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID:               "a-1",
+		InstaclustrClusterID:  "c-1",
+		InstaclustrUsername:   "someone",
+		InstaclustrUsePrivate: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubDiscoverInstaclustr(t, collector.InstaclustrTarget{}, errors.New("cluster management API unavailable"))
+	stubPublicEgressIP(t, "203.0.113.5", errors.New("must not be called"))
+	stubEnsureFirewallRule(t, collector.FirewallRule{}, false, errors.New("must not be reached"))
+
+	err := runRefreshFirewall(refreshFirewallCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "--allow-ip") {
+		t.Fatalf("expected a refusal naming --allow-ip, got %v", err)
 	}
 }
 

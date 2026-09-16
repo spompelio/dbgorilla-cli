@@ -50,9 +50,9 @@ func stubCreateInstaclustrRole(t *testing.T, err error) *[]string {
 	t.Helper()
 	var runs []string
 	orig := createInstaclustrRole
-	createInstaclustrRole = func(_ context.Context, dsn, _, _ string) error {
+	createInstaclustrRole = func(_ context.Context, dsn, _, _ string) ([]string, error) {
 		runs = append(runs, dsn)
-		return err
+		return nil, err
 	}
 	t.Cleanup(func() { createInstaclustrRole = orig })
 	return &runs

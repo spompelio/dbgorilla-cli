@@ -184,11 +184,16 @@ func runInstallInstaclustr(cmd *cobra.Command) error {
 		return fmt.Errorf("%w\n\nA just-created firewall rule can take ~a minute to apply; re-running is safe", err)
 	}
 	dsn := collector.InstaclustrAdminDSN(in.seedHost, 5432, in.ict.DefaultUserPassword)
-	if err := ensureRoleWithRetry(ctx, dsn, collector.InstaclustrMonitorUser, monitorPassword); err != nil {
+	roleWarnings, err := ensureRoleWithRetry(ctx, dsn, collector.InstaclustrMonitorUser, monitorPassword)
+	if err != nil {
 		rollbackRule()
 		return fmt.Errorf("%w\n\nA just-created firewall rule can take ~a minute to apply; re-running is safe", err)
 	}
-	fmt.Println(style.Success(fmt.Sprintf("✓ Monitoring role %q ready (pg_monitor + pg_read_all_data)", collector.InstaclustrMonitorUser)))
+	// The grants the role actually received are named by the warnings, if any:
+	// pg_read_all_data is not always grantable, so claiming it here would be a
+	// guess rather than a report.
+	fmt.Println(style.Success(fmt.Sprintf("✓ Monitoring role %q ready", collector.InstaclustrMonitorUser)))
+	printRoleWarnings(roleWarnings)
 
 	// Deep DB preflight with the monitoring role itself — the same gate the
 	// local path runs, so a cluster missing pg_stat_statements is a warning
@@ -412,12 +417,14 @@ func setupMonitoringRole(ctx context.Context, in *instaclustrInstall, monitorPas
 			fmt.Errorf("%w\n\nA just-created firewall rule can take ~a minute to apply; re-running is safe", err)
 	}
 	dsn := collector.InstaclustrAdminDSN(in.seedHost, 5432, in.ict.DefaultUserPassword)
-	if err := ensureRoleWithRetry(ctx, dsn, collector.InstaclustrMonitorUser, monitorPassword); err != nil {
+	roleWarnings, rerr := ensureRoleWithRetry(ctx, dsn, collector.InstaclustrMonitorUser, monitorPassword)
+	if rerr != nil {
 		removeOperatorRule()
 		return collector.FirewallRule{}, false, nil,
-			fmt.Errorf("%w\n\nA just-created firewall rule can take ~a minute to apply; re-running is safe", err)
+			fmt.Errorf("%w\n\nA just-created firewall rule can take ~a minute to apply; re-running is safe", rerr)
 	}
-	fmt.Println(style.Success(fmt.Sprintf("✓ Monitoring role %q ready (pg_monitor + pg_read_all_data)", collector.InstaclustrMonitorUser)))
+	fmt.Println(style.Success(fmt.Sprintf("✓ Monitoring role %q ready", collector.InstaclustrMonitorUser)))
+	printRoleWarnings(roleWarnings)
 	return opRule, opCreated, removeOperatorRule, nil
 }
 
@@ -506,24 +513,38 @@ func dryRunInstaclustr(cmd *cobra.Command, ict collector.InstaclustrTarget, seed
 // seconds ago may not pass packets yet, and the symptom is a dial timeout or
 // refusal. Only connection failures retry — SQL failures are deterministic
 // and retrying them just delays the real error.
-func ensureRoleWithRetry(ctx context.Context, dsn, user, password string) error {
-	var err error
+func ensureRoleWithRetry(ctx context.Context, dsn, user, password string) ([]string, error) {
+	var (
+		warnings []string
+		err      error
+	)
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(8 * time.Second):
 			}
 		}
-		if err = createInstaclustrRole(ctx, dsn, user, password); err == nil {
-			return nil
+		if warnings, err = createInstaclustrRole(ctx, dsn, user, password); err == nil {
+			return warnings, nil
 		}
 		if !collector.RetriableRoleError(err) {
-			return err
+			return warnings, err
 		}
 	}
-	return err
+	return warnings, err
+}
+
+// printRoleWarnings surfaces what the role ended up NOT being able to do. The
+// install continues either way, so these have to be visible at the one moment
+// someone is watching: a role missing pg_read_all_data connects, monitors and
+// captures schema exactly like a complete one, and the gap only appears much
+// later, the first time something tries to read a table.
+func printRoleWarnings(warnings []string) {
+	for _, w := range warnings {
+		fmt.Println(style.Warn("⚠  " + w))
+	}
 }
 
 // describeInstaclustrShape says what discovery concluded about the cluster

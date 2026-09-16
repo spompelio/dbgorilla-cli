@@ -17,6 +17,15 @@
   public egress address — which admitted the wrong host and still left setup
   unable to connect.
 
+- The install no longer aborts when the cluster's default user cannot grant
+  `pg_read_all_data`. On a managed cluster that grant is refused outright —
+  PostgreSQL 16 and later require ADMIN OPTION on a role to grant it, and the
+  default user holds no membership in it — so the install used to fail at the
+  last statement of role setup, having already created a perfectly usable role.
+  It now warns and continues, and says what the role can still do: monitoring,
+  topology and schema capture are unaffected, and only running a query or an
+  EXPLAIN against a table would need SELECT granted on that table directly.
+
 ### Added
 
 - The install reports where a cluster runs and how it is reachable: the

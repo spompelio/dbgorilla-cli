@@ -218,10 +218,10 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 //
 // Error messages never include statement text: the CREATE/ALTER statements
 // carry the live password, and these errors reach terminals and CI logs.
-func EnsureInstaclustrRole(ctx context.Context, dsn, user, password string) error {
+func EnsureInstaclustrRole(ctx context.Context, dsn, user, password string) (warnings []string, err error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		return fmt.Errorf("%w to create the monitoring role: %w", errClusterUnreachable, err)
+		return nil, fmt.Errorf("%w to create the monitoring role: %w", errClusterUnreachable, err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	// The role name is quoted as an identifier: every caller passes the
@@ -230,24 +230,64 @@ func EnsureInstaclustrRole(ctx context.Context, dsn, user, password string) erro
 	quoted := strings.ReplaceAll(password, "'", "''")
 	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", role, quoted)); err != nil {
 		if !isBenignGrantErr(err) {
-			return fmt.Errorf("creating role %s failed: %w", user, redactPassword(err, quoted, password))
+			return nil, fmt.Errorf("creating role %s failed: %w", user, redactPassword(err, quoted, password))
 		}
 		if _, aerr := conn.Exec(ctx, fmt.Sprintf("ALTER ROLE %s WITH LOGIN PASSWORD '%s'", role, quoted)); aerr != nil {
-			return fmt.Errorf("updating role %s's password failed: %w", user, redactPassword(aerr, quoted, password))
+			return nil, fmt.Errorf("updating role %s's password failed: %w", user, redactPassword(aerr, quoted, password))
 		}
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf("GRANT pg_monitor TO %s", role)); err != nil && !isBenignGrantErr(err) {
-		return fmt.Errorf("granting pg_monitor to %s failed: %w", user, err)
+		return nil, fmt.Errorf("granting pg_monitor to %s failed: %w", user, err)
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf("GRANT pg_read_all_data TO %s", role)); err != nil && !isBenignGrantErr(err) {
-		// 42704 undefined_object: the role does not exist before PG 14 — the
-		// monitor grant above still stands, so degrade rather than fail.
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "42704" {
-			return fmt.Errorf("granting pg_read_all_data to %s failed: %w", user, err)
+		warning, fatal := classifyReadAllDataGrant(err, user)
+		if fatal {
+			return warnings, fmt.Errorf("granting pg_read_all_data to %s failed: %w", user, err)
 		}
+		warnings = append(warnings, warning)
 	}
-	return nil
+	return warnings, nil
+}
+
+// classifyReadAllDataGrant decides whether a refused pg_read_all_data grant
+// ends the install or merely narrows the role, and says what was lost.
+//
+// Two refusals are legitimate, and neither is a reason to abandon a role that
+// is otherwise ready:
+//
+//	42704 undefined_object       the role predates PostgreSQL 14.
+//	42501 insufficient_privilege PG 16+ requires ADMIN OPTION on a role to
+//	                             grant it, and Instaclustr's default user holds
+//	                             no membership in pg_read_all_data at all. No
+//	                             install can clear that, so failing would block
+//	                             every install rather than report a reduced one.
+//
+// Anything else is a real failure.
+//
+// What the warning must NOT claim is that monitoring is degraded. pg_monitor
+// already carries the statistics views, and the only dump this role feeds is
+// `pg_dump --statistics-only`, which reads pg_statistic — so metrics, topology
+// and schema capture are all unaffected. What the grant buys is SELECT on user
+// tables, and the only features that need it are running a query or an EXPLAIN
+// against one. Naming the wrong casualty would send an operator looking for a
+// monitoring fault that isn't there.
+func classifyReadAllDataGrant(err error, user string) (warning string, fatal bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", true
+	}
+	const consequence = "Monitoring, topology and schema capture are unaffected; running a query or an " +
+		"EXPLAIN against a table would need SELECT granted on that table directly."
+	switch pgErr.Code {
+	case "42704":
+		return fmt.Sprintf("this server predates the pg_read_all_data role (PostgreSQL 14 introduced it), so %s "+
+			"can read statistics but not table contents. %s", user, consequence), false
+	case "42501":
+		return fmt.Sprintf("the cluster's default user cannot grant pg_read_all_data, so %s can read statistics "+
+			"but not table contents. %s", user, consequence), false
+	default:
+		return "", true
+	}
 }
 
 // redactPassword scrubs the role password (raw and SQL-quoted forms) from an

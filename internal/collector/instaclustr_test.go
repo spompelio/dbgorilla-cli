@@ -16,6 +16,9 @@ type icFake struct {
 	t         *testing.T
 	responses map[string]icResp
 	calls     []string
+	// bodies records the request body of each non-GET call, in call order, so
+	// a test can assert what a set-replacing PUT actually sent.
+	bodies []string
 }
 
 type icResp struct {
@@ -26,6 +29,10 @@ type icResp struct {
 func (f *icFake) RoundTrip(req *http.Request) (*http.Response, error) {
 	key := req.Method + " " + req.URL.Path
 	f.calls = append(f.calls, key)
+	if req.Method != http.MethodGet && req.Body != nil {
+		raw, _ := io.ReadAll(req.Body)
+		f.bodies = append(f.bodies, string(raw))
+	}
 	if user, _, ok := req.BasicAuth(); !ok || user == "" {
 		f.t.Fatalf("request %s carried no basic auth", key)
 	}

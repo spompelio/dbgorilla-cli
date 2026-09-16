@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+// firewallRuleTypePostgreSQL is the allowlist entry kind the collector needs.
+// Instaclustr's FirewallRuleTypesV2 also carries PGBOUNCER, which nothing here
+// opens.
+const firewallRuleTypePostgreSQL = "POSTGRESQL"
+
 // FirewallRule is one entry on a cluster's PostgreSQL allowlist.
 type FirewallRule struct {
 	ID        string `json:"id"`
@@ -39,7 +44,7 @@ func ListInstaclustrFirewallRules(ctx context.Context, creds InstaclustrCreds, c
 // callers record rule IDs for ownership, and a synthetic empty-ID rule would
 // silently break refresh-firewall's rotation later.
 func AddInstaclustrFirewallRule(ctx context.Context, creds InstaclustrCreds, clusterID, cidr string) (FirewallRule, error) {
-	body := fmt.Sprintf(`{"clusterId":%q,"network":%q,"type":"POSTGRESQL"}`, clusterID, cidr)
+	body := fmt.Sprintf(`{"clusterId":%q,"network":%q,"type":%q}`, clusterID, cidr, firewallRuleTypePostgreSQL)
 	data, err := icSend(ctx, creds, http.MethodPost, "/cluster-management/v2/resources/network-firewall-rules/v2/", strings.NewReader(body))
 	if err != nil {
 		if icStatus(err) == http.StatusConflict {
@@ -62,7 +67,7 @@ func findFirewallRule(ctx context.Context, creds InstaclustrCreds, clusterID, ci
 		return FirewallRule{}, err
 	}
 	for _, r := range rules {
-		if r.Type == "POSTGRESQL" && r.Network == cidr {
+		if r.Type == firewallRuleTypePostgreSQL && r.Network == cidr {
 			return r, nil
 		}
 	}
@@ -88,7 +93,7 @@ func EnsureFirewallRule(ctx context.Context, creds InstaclustrCreds, clusterID, 
 		return FirewallRule{}, false, err
 	}
 	for _, r := range rules {
-		if r.Type == "POSTGRESQL" && r.Network == cidr {
+		if r.Type == firewallRuleTypePostgreSQL && r.Network == cidr {
 			return r, false, nil
 		}
 	}

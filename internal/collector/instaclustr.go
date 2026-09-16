@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -36,7 +37,42 @@ type InstaclustrTarget struct {
 	// cluster-detail call. Used transiently to create the monitoring role;
 	// never persisted, never rendered into any config.
 	DefaultUserPassword string
-	Nodes               []InstaclustrNode
+	// ProviderAccountName names the cloud account the substrate runs in:
+	// literally "INSTACLUSTR" for Instaclustr's own accounts, the customer's
+	// provider account name when the account is linked. Read from the primary
+	// data centre.
+	ProviderAccountName string
+	// VpcID is the cluster's own VPC. Reported only for a linked account, and
+	// only once provisioning has created it — empty while the cluster is in
+	// GENESIS, which is why it corroborates residency rather than deciding it.
+	VpcID string
+	// NetworkCIDRs are the primary data centre's network blocks, for
+	// reachability preflight and peering.
+	NetworkCIDRs []string
+	// PrivateNetworkCluster is true when the cluster was created without
+	// public addresses. This — not residency — is what forces private
+	// addressing, because there is no public address to dial.
+	PrivateNetworkCluster bool
+	Nodes                 []InstaclustrNode
+}
+
+// instaclustrOwnAccount is the provider account name the API reports for a
+// cluster running in Instaclustr's own cloud accounts.
+const instaclustrOwnAccount = "INSTACLUSTR"
+
+// LinkedAccount reports whether the substrate runs in the customer's own
+// cloud account (BYOC) rather than Instaclustr's.
+//
+// providerAccountName is the signal; the VPC id only corroborates it, and
+// stands in while a freshly created cluster has not reported an account name
+// yet. Residency says nothing about which addresses to dial: a linked-account
+// cluster keeps public addresses unless PrivateNetworkCluster says otherwise,
+// and the fixture this was built against is exactly that shape.
+func (t InstaclustrTarget) LinkedAccount() bool {
+	if t.ProviderAccountName != "" {
+		return !strings.EqualFold(t.ProviderAccountName, instaclustrOwnAccount)
+	}
+	return t.VpcID != ""
 }
 
 // InstaclustrNode is one addressable node.
@@ -63,10 +99,28 @@ type instaclustrClusterDetail struct {
 	Status              string `json:"status"`
 	PostgresqlVersion   string `json:"postgresqlVersion"`
 	DefaultUserPassword string `json:"defaultUserPassword"`
-	DataCentres         []struct {
+	// PrivateNetworkCluster is a cluster-wide property, not a per-DC one.
+	PrivateNetworkCluster bool `json:"privateNetworkCluster"`
+	DataCentres           []struct {
 		CloudProvider string `json:"cloudProvider"`
 		Region        string `json:"region"`
-		Nodes         []struct {
+		// ProviderAccountName is "INSTACLUSTR" on their own accounts and the
+		// customer's provider account name on a linked one.
+		ProviderAccountName *string `json:"providerAccountName"`
+		// AwsSettings carries customVirtualNetworkId — the cluster's VPC,
+		// populated once provisioning creates it and null before that.
+		AwsSettings []struct {
+			CustomVirtualNetworkID *string `json:"customVirtualNetworkId"`
+		} `json:"awsSettings"`
+		Networks []struct {
+			CIDR string `json:"cidr"`
+		} `json:"networks"`
+		// The primary flag lives under the replication block rather than on
+		// the data centre itself.
+		InterDataCentreReplication []struct {
+			IsPrimaryDataCentre bool `json:"isPrimaryDataCentre"`
+		} `json:"interDataCentreReplication"`
+		Nodes []struct {
 			ID             string  `json:"id"`
 			PublicAddress  *string `json:"publicAddress"`
 			PrivateAddress *string `json:"privateAddress"`
@@ -85,17 +139,46 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 		return InstaclustrTarget{}, err
 	}
 	t := InstaclustrTarget{
-		ClusterID:           detail.ID,
-		Name:                detail.Name,
-		Status:              detail.Status,
-		PostgresVersion:     detail.PostgresqlVersion,
-		DefaultUserPassword: detail.DefaultUserPassword,
+		ClusterID:             detail.ID,
+		Name:                  detail.Name,
+		Status:                detail.Status,
+		PostgresVersion:       detail.PostgresqlVersion,
+		DefaultUserPassword:   detail.DefaultUserPassword,
+		PrivateNetworkCluster: detail.PrivateNetworkCluster,
 	}
-	for _, dc := range detail.DataCentres {
-		if t.CloudProvider == "" {
-			t.CloudProvider = dc.CloudProvider
-			t.Region = dc.Region
+	// Cloud, region, residency and networking all describe the PRIMARY data
+	// centre: on a multi-region cluster the others hold no writer, and the
+	// provider crate reads them the same way. A single-DC cluster may flag no
+	// DC at all, so the first one stands in.
+	if len(detail.DataCentres) > 0 {
+		primary := 0
+		for i, dc := range detail.DataCentres {
+			for _, r := range dc.InterDataCentreReplication {
+				if r.IsPrimaryDataCentre {
+					primary = i
+				}
+			}
 		}
+		dc := detail.DataCentres[primary]
+		t.CloudProvider = dc.CloudProvider
+		t.Region = dc.Region
+		if dc.ProviderAccountName != nil {
+			t.ProviderAccountName = *dc.ProviderAccountName
+		}
+		for _, s := range dc.AwsSettings {
+			if s.CustomVirtualNetworkID != nil && *s.CustomVirtualNetworkID != "" {
+				t.VpcID = *s.CustomVirtualNetworkID
+				break
+			}
+		}
+		for _, n := range dc.Networks {
+			if n.CIDR != "" {
+				t.NetworkCIDRs = append(t.NetworkCIDRs, n.CIDR)
+			}
+		}
+	}
+	// Nodes are flattened across every data centre, primary or not.
+	for _, dc := range detail.DataCentres {
 		for _, n := range dc.Nodes {
 			if n.DeletionTime != nil && *n.DeletionTime != "" {
 				continue
@@ -305,6 +388,133 @@ func InstaclustrAdminDSNAs(user, password, host string, port int) string {
 		RawQuery: "sslmode=require&connect_timeout=8",
 	}
 	return u.String()
+}
+
+// PrimaryHost picks the cluster's primary out of candidate addresses by
+// asking each one pg_is_in_recovery().
+//
+// The cluster API cannot answer this: every PostgreSQL node reports the same
+// nodeRoles, and the listing order carries no meaning, so the first node is a
+// standby about as often as not. Setup only works against the primary —
+// CREATE ROLE and ALTER ROLE both fail on a standby with SQLSTATE 25006 — so
+// the address is settled by protocol, exactly as the collector settles node
+// roles during discovery.
+//
+// A lone candidate is returned unprobed: a single-node cluster is its own
+// primary, and probing would only add a round trip to the common case.
+// Multi-region clusters need no data-centre preference either, because only
+// the primary data centre holds a writer; the probe finds it wherever it is.
+func PrimaryHost(ctx context.Context, hosts []string, port int, password string) (string, error) {
+	switch len(hosts) {
+	case 0:
+		return "", errors.New("no addressable node to probe for the cluster primary")
+	case 1:
+		return hosts[0], nil
+	}
+	attempts := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		inRecovery, err := hostInRecovery(ctx, h, port, password)
+		if err != nil {
+			attempts = append(attempts, fmt.Sprintf("%s: %v", h, err))
+			continue
+		}
+		if !inRecovery {
+			return h, nil
+		}
+		attempts = append(attempts, h+": standby")
+	}
+	return "", fmt.Errorf("no node answered as the cluster primary — %s. "+
+		"The cluster API reports the same role for every node, so the primary is "+
+		"identified by pg_is_in_recovery(); a cluster mid-failover briefly has none, "+
+		"and re-running is safe", strings.Join(attempts, "; "))
+}
+
+// localSourceFor returns the local address the OS would send from to reach
+// addr. A UDP "connection" only performs the route lookup — no packet leaves
+// the machine — which makes it a cheap way to ask the routing table a
+// question Go's standard library otherwise cannot. A package-level var so
+// tests can answer for a machine they are not running on.
+var localSourceFor = func(addr string) (net.IP, error) {
+	c, err := net.Dial("udp", net.JoinHostPort(addr, "53"))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = c.Close() }()
+	ua, ok := c.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil, errors.New("could not read the local address for the route")
+	}
+	return ua.IP, nil
+}
+
+// PrivatePathToCluster reports what this machine would use to reach the
+// cluster's own network, and whether that route is recognisably a private one.
+//
+// A private-network cluster has no public address, so the install only works
+// from inside the network: on the VPN, in a peered VPC, or on a bastion. Two
+// signals recognise that without sending a packet — this machine already
+// holding an address inside the cluster's CIDR, or traffic to that CIDR
+// leaving from a different source address than traffic to the open internet.
+//
+// Neither signal is conclusive the other way. A more specific route out the
+// SAME interface — an on-prem VPN appliance, a LAN gateway onto a peered
+// network — reaches the cluster without changing the source address, and Go
+// cannot read the routing table portably to tell that apart from having no
+// route at all. So a false result means "not recognised", never "unreachable",
+// and callers should warn rather than refuse and let the connection itself
+// settle it.
+//
+// The returned address is the source the OS picked for the cluster network
+// whenever a lookup succeeded, recognised or not. On a private-network cluster
+// that is the address the cluster sees, which makes it the right thing to
+// allowlist — the machine's public egress address would be the wrong host.
+func PrivatePathToCluster(cidrs []string) (net.IP, string, bool) {
+	defaultSrc, defaultErr := localSourceFor("1.1.1.1")
+	var routed net.IP
+	for _, c := range cidrs {
+		_, network, err := net.ParseCIDR(c)
+		if err != nil {
+			continue
+		}
+		// Probe a host inside the block. Setting the low bit lands on the
+		// first host for any prefix that has one, and never walks outside the
+		// network the way an increment would on a block ending in .255; a
+		// host route (/32) is already the address to probe.
+		probe := append(net.IP(nil), network.IP...)
+		if ones, bits := network.Mask.Size(); ones < bits {
+			probe[len(probe)-1] |= 1
+		}
+		src, err := localSourceFor(probe.String())
+		if err != nil {
+			continue
+		}
+		if routed == nil {
+			routed = src
+		}
+		if network.Contains(src) {
+			return src, fmt.Sprintf("this machine holds %s inside the cluster network %s", src, c), true
+		}
+		if defaultErr == nil && !src.Equal(defaultSrc) {
+			return src, fmt.Sprintf("traffic to %s leaves from %s rather than the default route's %s", c, src, defaultSrc), true
+		}
+	}
+	return routed, "", false
+}
+
+// hostInRecovery answers pg_is_in_recovery() for one node. A standby says
+// true; the primary says false. A package-level var so tests can settle roles
+// without a live cluster, the same seam as instaclustrClient.
+var hostInRecovery = func(ctx context.Context, host string, port int, password string) (bool, error) {
+	conn, err := pgx.Connect(ctx, InstaclustrAdminDSN(host, port, password))
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var inRecovery bool
+	if err := conn.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+		return false, err
+	}
+	return inRecovery, nil
 }
 
 // AllowCIDR normalizes a user-supplied allow address into the single-host

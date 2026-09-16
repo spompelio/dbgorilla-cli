@@ -23,6 +23,10 @@ type CollectorSubnet struct {
 	ID   string
 	CIDR string
 	AZ   string
+	// VpcID is carried so an explicitly passed subnet can be checked against
+	// the cluster's VPC. Discovery always fills it with the VPC asked for; the
+	// --subnets override is where it can differ.
+	VpcID string
 	// InternetRoute names the gateway carrying the subnet's default route — an
 	// internet gateway or a NAT gateway. Empty means the subnet has no route
 	// off the VPC at all, and a task there could not pull its image, hold the
@@ -73,6 +77,7 @@ func DiscoverCollectorSubnets(ctx context.Context, client *ec2.Client, vpcID str
 			ID:            id,
 			CIDR:          aws.ToString(s.CidrBlock),
 			AZ:            aws.ToString(s.AvailabilityZone),
+			VpcID:         aws.ToString(s.VpcId),
 			InternetRoute: gateway,
 			NeedsPublicIP: viaIGW,
 		})

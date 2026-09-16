@@ -42,6 +42,10 @@ type InstaclustrTarget struct {
 	// provider account name when the account is linked. Read from the primary
 	// data centre.
 	ProviderAccountName string
+	// DataCentreID names the cluster's own AWS security group, which is
+	// "ic-<DataCentreID>-<suffix>". That group is where Instaclustr's firewall
+	// rules actually land, so it is what a static reachability check reads.
+	DataCentreID string
 	// VpcID is the cluster's own VPC. Reported only for a linked account, and
 	// only once provisioning has created it — empty while the cluster is in
 	// GENESIS, which is why it corroborates residency rather than deciding it.
@@ -124,6 +128,10 @@ type instaclustrClusterDetail struct {
 	// PrivateNetworkCluster is a cluster-wide property, not a per-DC one.
 	PrivateNetworkCluster bool `json:"privateNetworkCluster"`
 	DataCentres           []struct {
+		// ID names the cluster's own AWS security group, which is
+		// "ic-<id>-<suffix>" — the enforcement point the firewall rules
+		// materialise into, and so what a reachability preflight has to read.
+		ID            string `json:"id"`
 		CloudProvider string `json:"cloudProvider"`
 		Region        string `json:"region"`
 		// ProviderAccountName is "INSTACLUSTR" on their own accounts and the
@@ -188,6 +196,7 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 			}
 		}
 		dc := detail.DataCentres[primary]
+		t.DataCentreID = dc.ID
 		t.CloudProvider = dc.CloudProvider
 		t.Region = dc.Region
 		if dc.ProviderAccountName != nil {

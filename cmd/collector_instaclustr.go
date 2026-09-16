@@ -43,6 +43,7 @@ var (
 	deleteFirewallRule    = collector.DeleteInstaclustrFirewallRule
 	ensureSGRule          = collector.EnsureSecurityGroupRule
 	removeSGRule          = collector.RemoveSecurityGroupRule
+	discoverVPCPlacement  = collector.DiscoverVPCPlacement
 	createInstaclustrRole = collector.EnsureInstaclustrRole
 	primaryHost           = collector.PrimaryHost
 	privatePathToCluster  = collector.PrivatePathToCluster
@@ -262,6 +263,10 @@ type instaclustrInstall struct {
 	// the public path, where the operator's public egress address is used
 	// instead.
 	privateSrc net.IP
+	// collectorPrivate is set when the collector is placed inside the
+	// cluster's VPC, where it dials private addresses even though the operator
+	// reached the cluster publicly to set it up.
+	collectorPrivate bool
 }
 
 // sourceIP is the address the cluster sees this machine arrive from: on a
@@ -280,8 +285,31 @@ func (in *instaclustrInstall) sourceIP(ctx context.Context) (string, error) {
 // the password variable of the deploy substrate. Called after the primary is
 // resolved, so it reads whatever in.seedHost has settled on.
 func (in *instaclustrInstall) component(passwordEnv string) collector.Component {
-	return collector.BuildInstaclustrComponent(in.ict, in.seedHost, 5432, in.databases, in.sslMode, "",
-		in.setupCreds.Username, in.usePrivate, passwordEnv)
+	host, private := in.collectorAddress()
+	return collector.BuildInstaclustrComponent(in.ict, host, 5432, in.databases, in.sslMode, "",
+		in.setupCreds.Username, private, passwordEnv)
+}
+
+// collectorAddress is the side the COLLECTOR dials, which is not always the
+// side the operator used.
+//
+// in.seedHost is whichever address THIS machine could reach to settle the
+// primary and create the role. A collector placed inside the cluster's VPC has
+// to seed from that same node's private address instead: a security-group
+// allowlist matches the source's private IP, so seeding from the public one
+// would leave the VPC through the internet gateway and never match the rule the
+// install just created for it.
+//
+// A node reporting no private address keeps the operator's host — a wrong
+// address is worse than a suboptimal one.
+func (in *instaclustrInstall) collectorAddress() (string, bool) {
+	if !in.collectorPrivate || in.usePrivate {
+		return in.seedHost, in.usePrivate
+	}
+	if private := in.ict.AddressOn(in.seedHost, true); private != "" {
+		return private, true
+	}
+	return in.seedHost, in.usePrivate
 }
 
 // resolveInstaclustrInstallInputs gathers everything the substrates share:
@@ -950,35 +978,10 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	}
 	fmt.Println(style.Success(fmt.Sprintf("✓ AWS identity: %s (%s)", identity, region)))
 
-	subnetsCSV, _ := cmd.Flags().GetString("subnets")
-	subnets := splitCSV(subnetsCSV)
-	sg, _ := cmd.Flags().GetString("security-group-id")
-	if len(subnets) == 0 || sg == "" {
-		return errors.New("--subnets and --security-group-id are required with --provider instaclustr --target aws: " +
-			"there is no RDS instance to discover networking from. The security group needs egress to 443 " +
-			"(the Instaclustr and DBGorilla APIs) and 5432 (the cluster)")
-	}
-	stableEgress, _ := cmd.Flags().GetBool("stable-egress")
-	vpcID, _ := cmd.Flags().GetString("vpc-id")
-	natCidr, _ := cmd.Flags().GetString("nat-subnet-cidr")
-	allowRaw, _ := cmd.Flags().GetString("allow-ip")
-	if stableEgress {
-		if vpcID == "" || natCidr == "" {
-			return errors.New("--vpc-id and --nat-subnet-cidr are required with --stable-egress " +
-				"(the stack creates a private subnet routed through a NAT gateway with an Elastic IP; " +
-				"the FIRST --subnets entry must be a public subnet for the NAT gateway). " +
-				"Pass --stable-egress=false with --allow-ip to skip the NAT at the cost of firewall churn")
-		}
-		// Validate here rather than letting the deploy fail on it after the
-		// role and firewall work is already done.
-		if _, _, cerr := net.ParseCIDR(natCidr); cerr != nil {
-			return fmt.Errorf("--nat-subnet-cidr %q is not a CIDR (e.g. 10.0.200.0/28)", natCidr)
-		}
-	} else if allowRaw == "" {
-		return errors.New("--stable-egress=false needs --allow-ip: a plain Fargate task's public IP is " +
-			"ephemeral, so the firewall entry must be an address you manage (a NAT you already have)")
-	}
-
+	// Discovery comes before the networking decision: a cluster in the
+	// customer's own account names the VPC the collector belongs in, and that
+	// changes which flags are required and which are refused. Nothing here
+	// mutates anything.
 	in, err := resolveInstaclustrInstallInputs(cmd, apiURL, dryRun)
 	if err != nil {
 		return err
@@ -987,26 +990,30 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	stackName, _ := cmd.Flags().GetString("stack-name")
 	templateURL, _ := cmd.Flags().GetString("template-url")
 
+	placement, err := resolveAWSPlacement(ctx, cmd, in.ict, region, stackName, dryRun)
+	if err != nil {
+		return err
+	}
+	// Inside the cluster's VPC the collector takes the private path, whatever
+	// side the operator had to use to reach the cluster from here.
+	in.collectorPrivate = placement.collectorUsePrivate
+
 	// The monitor password is generated up front so both the role step and
 	// the stack's DbPassword secret carry the same value.
 	monitorPassword, err := collector.GenerateInstaclustrPassword()
 	if err != nil {
 		return err
 	}
-	assignIP, _ := cmd.Flags().GetString("assign-public-ip")
-	if assignIP == "" {
-		assignIP = "ENABLED"
-	}
 	input := collector.AwsStackInput{
 		Region:          region,
 		AccountID:       accountID,
-		Subnets:         subnets,
-		SecurityGroup:   sg,
-		AssignPublicIP:  assignIP,
+		Subnets:         placement.subnets,
+		SecurityGroup:   placement.securityGroup,
+		AssignPublicIP:  placement.assignPublicIP,
 		CommandsEnabled: false,
-		StableEgress:    stableEgress,
-		VpcID:           vpcID,
-		NatSubnetCidr:   natCidr,
+		StableEgress:    placement.stableEgress,
+		VpcID:           placement.vpcID,
+		NatSubnetCidr:   placement.natSubnetCidr,
 	}
 
 	if dryRun {
@@ -1089,15 +1096,21 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 		return derr
 	}
 
-	// Allowlist the collector's actual egress: the EIP the stack allocated
-	// (stable egress) or the operator-supplied address.
-	if err := allowlistCollectorEgress(ctx, in, stableEgress, func() (string, error) {
+	// Allowlist the collector. Inside the cluster's VPC the entry names its
+	// security group, which a redeploy cannot invalidate; outside it, the entry
+	// has to name an address — the EIP the stack allocated under stable egress,
+	// or the one the operator supplied.
+	if placement.vpcResident() {
+		if err := allowlistCollectorSecurityGroup(ctx, in, placement, opCreated, removeOperatorRule); err != nil {
+			return err
+		}
+	} else if err := allowlistCollectorEgress(ctx, in, placement.stableEgress, func() (string, error) {
 		eip, oerr := stackOutput(stackName, region, "EgressIP")
 		if oerr != nil {
 			return "", fmt.Errorf("the stack deployed but its EgressIP output could not be read: %w", oerr)
 		}
 		return eip, nil
-	}, allowRaw, opRule, opCreated, removeOperatorRule); err != nil {
+	}, mustString(cmd, "allow-ip"), opRule, opCreated, removeOperatorRule); err != nil {
 		return err
 	}
 

@@ -381,8 +381,14 @@ func icAwsCmd(t *testing.T, apiURL string) *cobra.Command {
 func TestInstallInstaclustrAWSRequiresExplicitNetworking(t *testing.T) {
 	isolate(t)
 	writeTokens(t)
+	srv := installServer(t, "a-1")
+	defer srv.Close()
 	stubAWSOK(t)
-	cmd := icAwsCmd(t, "")
+	// The cluster is discovered before the networking is decided, because a
+	// BYOC cluster does not need these flags at all. icTestTarget is hosted on
+	// Instaclustr's own account, so they stay required.
+	stubDiscoverInstaclustr(t, icTestTarget(), nil)
+	cmd := icAwsCmd(t, srv.URL)
 	err := runInstall(cmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "--subnets and --security-group-id are required") {
 		t.Fatalf("expected the explicit-networking requirement, got %v", err)
@@ -392,8 +398,14 @@ func TestInstallInstaclustrAWSRequiresExplicitNetworking(t *testing.T) {
 func TestInstallInstaclustrAWSStableEgressNeedsVpcAndCidr(t *testing.T) {
 	isolate(t)
 	writeTokens(t)
+	srv := installServer(t, "a-1")
+	defer srv.Close()
 	stubAWSOK(t)
-	cmd := icAwsCmd(t, "")
+	// The cluster is discovered before the networking is decided, because a
+	// BYOC cluster does not need these flags at all. icTestTarget is hosted on
+	// Instaclustr's own account, so they stay required.
+	stubDiscoverInstaclustr(t, icTestTarget(), nil)
+	cmd := icAwsCmd(t, srv.URL)
 	mustSet(t, cmd, "subnets", "subnet-1")
 	mustSet(t, cmd, "security-group-id", "sg-1")
 	err := runInstall(cmd, nil)
@@ -405,8 +417,14 @@ func TestInstallInstaclustrAWSStableEgressNeedsVpcAndCidr(t *testing.T) {
 func TestInstallInstaclustrAWSNoStableEgressNeedsAllowIP(t *testing.T) {
 	isolate(t)
 	writeTokens(t)
+	srv := installServer(t, "a-1")
+	defer srv.Close()
 	stubAWSOK(t)
-	cmd := icAwsCmd(t, "")
+	// The cluster is discovered before the networking is decided, because a
+	// BYOC cluster does not need these flags at all. icTestTarget is hosted on
+	// Instaclustr's own account, so they stay required.
+	stubDiscoverInstaclustr(t, icTestTarget(), nil)
+	cmd := icAwsCmd(t, srv.URL)
 	mustSet(t, cmd, "subnets", "subnet-1")
 	mustSet(t, cmd, "security-group-id", "sg-1")
 	mustSet(t, cmd, "stable-egress", "false")

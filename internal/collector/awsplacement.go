@@ -167,3 +167,100 @@ func parseCIDRs(in []string) []*net.IPNet {
 	}
 	return out
 }
+
+// --- resolving a placement ---------------------------------------------------
+
+// VPCPlacement is the networking a collector will run with inside the cluster's
+// own VPC.
+type VPCPlacement struct {
+	VpcID   string
+	Subnets []CollectorSubnet
+	// SecurityGroupID is empty until EnsureSecurityGroup runs: discovery is
+	// read-only by construction, so the preflight can refuse a placement before
+	// anything exists to clean up.
+	SecurityGroupID      string
+	SecurityGroupCreated bool
+}
+
+// SubnetIDs is the id list the CloudFormation template takes.
+func (p VPCPlacement) SubnetIDs() []string { return SubnetIDs(p.Subnets) }
+
+// CIDRs are the collector's possible task addresses, used as the fallback when
+// the cluster allowlists a network rather than a security group.
+func (p VPCPlacement) CIDRs() []string {
+	out := make([]string, 0, len(p.Subnets))
+	for _, s := range p.Subnets {
+		if s.CIDR != "" {
+			out = append(out, s.CIDR)
+		}
+	}
+	return out
+}
+
+// AssignPublicIP reports what the task needs to reach the internet.
+//
+// Any chosen subnet that only routes through an internet gateway forces
+// ENABLED: such a subnet blackholes a task with no public address, and the task
+// still has to pull its image and hold the DBGorilla connection even when the
+// database leg is private. The allowlist keys on the security group, so the
+// address being ephemeral costs nothing.
+func (p VPCPlacement) AssignPublicIP() string {
+	for _, s := range p.Subnets {
+		if s.NeedsPublicIP {
+			return "ENABLED"
+		}
+	}
+	return "DISABLED"
+}
+
+// DiscoverVPCPlacement finds where the collector can run inside vpcID and
+// checks it. It creates nothing — every call is a describe — so a refusal here
+// leaves the account untouched.
+func DiscoverVPCPlacement(ctx context.Context, region, vpcID string) (VPCPlacement, []PlacementProblem, error) {
+	cfg, err := loadAWSConfig(ctx, region)
+	if err != nil {
+		return VPCPlacement{}, nil, err
+	}
+	client := ec2.NewFromConfig(cfg)
+
+	all, err := DiscoverCollectorSubnets(ctx, client, vpcID)
+	if err != nil {
+		return VPCPlacement{}, nil, err
+	}
+	usable := RoutableSubnets(all)
+	if len(usable) == 0 {
+		// Report against everything found, so the problem names the subnets the
+		// operator can actually see in the console.
+		return VPCPlacement{VpcID: vpcID, Subnets: all}, PreflightPlacement(vpcID, all), nil
+	}
+	p := VPCPlacement{VpcID: vpcID, Subnets: usable}
+	return p, PreflightPlacement(vpcID, usable), nil
+}
+
+// EnsureSecurityGroup creates the collector's security group in the placement's
+// VPC. This is the first thing in the placement flow that writes.
+func (p *VPCPlacement) EnsureSecurityGroup(ctx context.Context, region, stackName string) error {
+	cfg, err := loadAWSConfig(ctx, region)
+	if err != nil {
+		return err
+	}
+	id, created, err := EnsureCollectorSecurityGroup(ctx, ec2.NewFromConfig(cfg), p.VpcID, stackName)
+	if err != nil {
+		return err
+	}
+	p.SecurityGroupID, p.SecurityGroupCreated = id, created
+	return nil
+}
+
+// ReleaseSecurityGroup removes the security group if this run created it,
+// leaving one that already existed alone.
+func (p VPCPlacement) ReleaseSecurityGroup(ctx context.Context, region string) error {
+	if !p.SecurityGroupCreated || p.SecurityGroupID == "" {
+		return nil
+	}
+	cfg, err := loadAWSConfig(ctx, region)
+	if err != nil {
+		return err
+	}
+	return DeleteCollectorSecurityGroup(ctx, ec2.NewFromConfig(cfg), p.SecurityGroupID)
+}

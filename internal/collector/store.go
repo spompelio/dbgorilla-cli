@@ -90,6 +90,9 @@ type State struct {
 	// never retires an entry it does not own.
 	CollectorSecurityGroupID string `json:"collector_security_group_id,omitempty"`
 	SecurityGroupRuleID      string `json:"security_group_rule_id,omitempty"`
+	// CollectorSecurityGroupCreated records that the install made the group,
+	// so uninstall removes only a group this CLI is responsible for.
+	CollectorSecurityGroupCreated bool `json:"collector_security_group_created,omitempty"`
 
 	// gcp target (Region above is shared with aws).
 	Project        string `json:"project,omitempty"`

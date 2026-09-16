@@ -79,6 +79,27 @@ func (t InstaclustrTarget) LinkedAccount() bool {
 	return t.VpcID != ""
 }
 
+// AddressOn returns the address of whichever node carries host, on the
+// requested side.
+//
+// The operator resolves the primary over the side THIS machine can reach, which
+// for a public-address cluster is the public one — but a collector running
+// inside the cluster's VPC has to seed from that same node's private address,
+// or its first connection leaves the VPC and fails to match a security-group
+// allowlist. Empty when no node carries host, or carries no address on the
+// requested side.
+func (t InstaclustrTarget) AddressOn(host string, private bool) string {
+	if host == "" {
+		return ""
+	}
+	for _, n := range t.Nodes {
+		if n.PublicAddress == host || n.PrivateAddress == host {
+			return n.Host(private)
+		}
+	}
+	return ""
+}
+
 // InstaclustrNode is one addressable node.
 type InstaclustrNode struct {
 	ID             string

@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // icFake routes "METHOD /path" to a canned response; unstubbed calls fail the
@@ -431,4 +435,48 @@ func TestGcpDeploymentOutput(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// A setup probe asks for sslmode=require — encryption without verification,
+// because Instaclustr's per-cluster CA is not something this machine has.
+//
+// pgx follows libpq and defaults sslrootcert to ~/.postgresql/root.crt when that
+// file exists, which silently promotes require to verify-ca. The promoted
+// verification then fails against a CA that bundle does not sign, so an operator
+// who has ever configured a Postgres client CA saw the install die on an x509
+// error it never asked for.
+func TestSetupDSNIsNotPromotedByAnOperatorsRootCert(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".postgresql"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// pgx only stats this path to decide, so the contents do not matter.
+	if err := os.WriteFile(filepath.Join(home, ".postgresql", "root.crt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+
+	for name, dsn := range map[string]string{
+		"admin DSN":    InstaclustrAdminDSN("node.example", 5432, "pw"),
+		"admin DSN as": InstaclustrAdminDSNAs("someone", "pw", "node.example", 5432),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := pgconn.ParseConfig(dsn)
+			if err != nil {
+				t.Fatalf("ParseConfig: %v", err)
+			}
+			if cfg.TLSConfig == nil {
+				t.Fatal("require must still negotiate TLS")
+			}
+			// verify-ca checks the chain in this callback rather than through
+			// the standard verifier, so its presence is what distinguishes a
+			// promoted connection from a plain one.
+			if cfg.TLSConfig.VerifyPeerCertificate != nil {
+				t.Error("sslmode=require was promoted to verify-ca by the operator's ~/.postgresql/root.crt")
+			}
+			if cfg.TLSConfig.RootCAs != nil {
+				t.Error("a CA pool was attached to a connection that asked not to verify")
+			}
+		})
+	}
 }

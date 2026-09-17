@@ -481,6 +481,17 @@ func BuildInstaclustr(agentID, tenantID string, comp Component, eps Endpoints) C
 
 // InstaclustrAdminDSN is the connection string for the transient
 // role-creation step: the cluster's default user against one node.
+// sslrootcert is pinned empty on purpose. pgx follows libpq: when
+// ~/.postgresql/root.crt exists it defaults sslrootcert to that file, and a
+// non-empty sslrootcert silently promotes sslmode=require to verify-ca. The
+// promoted verification then fails against Instaclustr's per-cluster CA, which
+// that bundle does not sign — so an operator who has ever configured a Postgres
+// client CA sees the install die on "x509: certificate signed by unknown
+// authority" from a connection that never asked to verify anything. Setting the
+// parameter explicitly beats the default, because the connection string is
+// merged last. This connection is a transient setup probe, not the collector's
+// own link.
+//
 // sslmode=require always works — Instaclustr nodes negotiate TLS even on
 // clusters provisioned without client-to-cluster encryption; connect_timeout
 // keeps a firewalled node from hanging the install.
@@ -490,7 +501,7 @@ func InstaclustrAdminDSN(host string, port int, password string) string {
 		User:     url.UserPassword("icpostgresql", password),
 		Host:     fmt.Sprintf("%s:%d", host, port),
 		Path:     "/postgres",
-		RawQuery: "sslmode=require&connect_timeout=8",
+		RawQuery: "sslmode=require&sslrootcert=&connect_timeout=8",
 	}
 	return u.String()
 }
@@ -504,7 +515,7 @@ func InstaclustrAdminDSNAs(user, password, host string, port int) string {
 		User:     url.UserPassword(user, password),
 		Host:     fmt.Sprintf("%s:%d", host, port),
 		Path:     "/postgres",
-		RawQuery: "sslmode=require&connect_timeout=8",
+		RawQuery: "sslmode=require&sslrootcert=&connect_timeout=8",
 	}
 	return u.String()
 }

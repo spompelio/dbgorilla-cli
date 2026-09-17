@@ -226,11 +226,22 @@ func DiscoverInstaclustrCluster(ctx context.Context, creds InstaclustrCreds, clu
 		// A data centre still being provisioned can report an empty cloud and
 		// region; a sibling that has them is better than rendering a collector
 		// config with neither.
+		//
+		// Only a sibling that actually reports a cloud is worth copying, and its
+		// region is taken only to fill a gap: the primary's own region, when it
+		// has one, is the accurate answer and a sibling must never overwrite it.
+		// Copying unconditionally erased a region the API had already given us.
 		for _, other := range detail.DataCentres {
 			if t.CloudProvider != "" {
 				break
 			}
-			t.CloudProvider, t.Region = other.CloudProvider, other.Region
+			if other.CloudProvider == "" {
+				continue
+			}
+			t.CloudProvider = other.CloudProvider
+			if t.Region == "" {
+				t.Region = other.Region
+			}
 		}
 		t.VpcID = customVirtualNetworkID(dc.AwsSettings, dc.GcpSettings, dc.AzureSettings)
 		for _, n := range dc.Networks {

@@ -255,3 +255,72 @@ func TestDiscoverFallsBackToASiblingForAnEmptyCloudAndRegion(t *testing.T) {
 		t.Fatalf("cloud/region should fall through to a sibling, got %q/%q", got.CloudProvider, got.Region)
 	}
 }
+
+// dcBody renders a two-data-centre cluster whose FIRST centre is flagged
+// primary, so the fallback below is exercised on the centre that actually wins.
+func dcBody(primaryCloud, primaryRegion, siblingCloud, siblingRegion string) string {
+	return `{
+  "id":"c-1","name":"orders","status":"RUNNING","postgresqlVersion":"18.4.0",
+  "dataCentres":[
+    {"cloudProvider":"` + primaryCloud + `","region":"` + primaryRegion + `",
+     "interDataCentreReplication":[{"isPrimaryDataCentre":true}],
+     "nodes":[{"id":"n1","publicAddress":"203.0.113.10"}]},
+    {"cloudProvider":"` + siblingCloud + `","region":"` + siblingRegion + `",
+     "nodes":[{"id":"n2","publicAddress":"203.0.113.11"}]}
+  ]}`
+}
+
+// A data centre mid-provision reports an empty cloud, and a sibling fills it.
+// What a sibling must never do is erase something the primary did report: the
+// primary's own region is the accurate answer for the primary.
+func TestPrimaryDataCentreFallbackNeverErasesAKnownValue(t *testing.T) {
+	creds := InstaclustrCreds{Username: "u", APIKey: "key123"}
+	const path = "GET /cluster-management/v2/resources/applications/postgresql/clusters/v2/c-1"
+
+	for _, tc := range []struct {
+		name                  string
+		body                  string
+		wantCloud, wantRegion string
+	}{
+		{
+			// The regression: copying from a sibling that has nothing took its
+			// empty region along and destroyed US_EAST_1.
+			name:       "a sibling with nothing leaves the primary's region alone",
+			body:       dcBody("", "US_EAST_1", "", ""),
+			wantCloud:  "",
+			wantRegion: "US_EAST_1",
+		},
+		{
+			name:       "a sibling with a cloud fills only the empty cloud",
+			body:       dcBody("", "US_EAST_1", "AWS_VPC", "US_WEST_2"),
+			wantCloud:  "AWS_VPC",
+			wantRegion: "US_EAST_1",
+		},
+		{
+			name:       "a sibling fills both when the primary has neither",
+			body:       dcBody("", "", "AWS_VPC", "US_WEST_2"),
+			wantCloud:  "AWS_VPC",
+			wantRegion: "US_WEST_2",
+		},
+		{
+			name:       "a complete primary is never overwritten",
+			body:       dcBody("AWS_VPC", "US_EAST_1", "GCP", "us-central1"),
+			wantCloud:  "AWS_VPC",
+			wantRegion: "US_EAST_1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubInstaclustr(t, map[string]icResp{path: {200, tc.body}})
+			got, err := DiscoverInstaclustrCluster(context.Background(), creds, "c-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.CloudProvider != tc.wantCloud {
+				t.Errorf("CloudProvider = %q, want %q", got.CloudProvider, tc.wantCloud)
+			}
+			if got.Region != tc.wantRegion {
+				t.Errorf("Region = %q, want %q", got.Region, tc.wantRegion)
+			}
+		})
+	}
+}

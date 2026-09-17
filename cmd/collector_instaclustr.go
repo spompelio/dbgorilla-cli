@@ -43,6 +43,7 @@ var (
 	deleteFirewallRule    = collector.DeleteInstaclustrFirewallRule
 	ensureSGRule          = collector.EnsureSecurityGroupRule
 	discoverVPCPlacement  = collector.DiscoverVPCPlacement
+	releaseCollectorSG    = collector.ReleaseCollectorSecurityGroup
 	createInstaclustrRole = collector.EnsureInstaclustrRole
 	primaryHost           = collector.PrimaryHost
 	privatePathToCluster  = collector.PrivatePathToCluster
@@ -997,6 +998,22 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	// side the operator had to use to reach the cluster from here.
 	in.collectorPrivate = placement.collectorUsePrivate
 
+	// The collector's security group is created before the role, the identity
+	// and the stack, so every failure from here on has to hand it back — an
+	// orphaned group is invisible, and the next install adopts it by name
+	// rather than recreating it, inheriting whatever state it was left in.
+	// Only a group this run created is released; one that already existed is
+	// not ours to remove.
+	releasePlacement := func() {
+		if placement.vpc == nil {
+			return
+		}
+		if rerr := placement.vpc.ReleaseSecurityGroup(ctx, region); rerr != nil {
+			fmt.Println(style.Warn(fmt.Sprintf("⚠  could not remove the collector security group %s: %v",
+				placement.securityGroup, rerr)))
+		}
+	}
+
 	// The monitor password is generated up front so both the role step and
 	// the stack's DbPassword secret carry the same value.
 	monitorPassword, err := collector.GenerateInstaclustrPassword()
@@ -1038,6 +1055,7 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	// the address the collector should actually seed from.
 	opRule, opCreated, removeOperatorRule, err := setupMonitoringRole(ctx, in, monitorPassword)
 	if err != nil {
+		releasePlacement()
 		return err
 	}
 	input.Components = []collector.Component{in.component(collector.CloudDBPasswordEnv)}
@@ -1046,6 +1064,7 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 	creds, err := in.client.ProvisionCollector()
 	if err != nil {
 		removeOperatorRule()
+		releasePlacement()
 		return err
 	}
 	fmt.Println(style.Success(fmt.Sprintf("✓ Collector provisioned (agent %s, tenant %s)", creds.AgentID, creds.TenantID)))
@@ -1087,11 +1106,16 @@ func runInstallInstaclustrAWS(cmd *cobra.Command) error {
 		// An interrupt, a lost operation, or a timeout must NOT tear down a
 		// stack that is most likely still converging server-side;
 		// cloudDeployFailed keeps those and rolls back only real failures.
-		_, derr := cloudDeployFailed(err, in.client, creds.AgentID, collector.DeployTimeout(), "stack", stackName,
+		kept, derr := cloudDeployFailed(err, in.client, creds.AgentID, collector.DeployTimeout(), "stack", stackName,
 			func() error { return deleteStack(stackName, region) }, nil,
 			"   Watch it with: dbg collector status, then re-run `dbg collector refresh-firewall` once it is up "+
 				"(the EgressIP output appears only once the stack completes, so the firewall entry waits for it).\n")
 		removeOperatorRule()
+		// A kept stack is still converging and its task needs the security
+		// group; only a rolled-back one leaves it orphaned.
+		if !kept {
+			releasePlacement()
+		}
 		return derr
 	}
 

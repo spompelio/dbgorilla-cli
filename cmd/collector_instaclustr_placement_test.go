@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -200,4 +201,71 @@ func TestCollectorAddressMapsToThePrivateSide(t *testing.T) {
 	if host, _ := bare.collectorAddress(); host != "203.0.113.10" {
 		t.Errorf("got %q, want the operator's host when there is no private address", host)
 	}
+}
+
+func stubReleaseCollectorSG(t *testing.T, err error) *[]string {
+	t.Helper()
+	var released []string
+	orig := releaseCollectorSG
+	releaseCollectorSG = func(_ context.Context, _, groupID string) error {
+		released = append(released, groupID)
+		return err
+	}
+	t.Cleanup(func() { releaseCollectorSG = orig })
+	return &released
+}
+
+// Uninstall hands back the group the install created, and leaves alone one that
+// already existed.
+func TestUninstallReleasesOnlyASecurityGroupItCreated(t *testing.T) {
+	t.Run("created by the install", func(t *testing.T) {
+		isolate(t)
+		released := stubReleaseCollectorSG(t, nil)
+		releaseCollectorSecurityGroup(context.Background(), &collector.State{
+			Target: "aws", Region: "us-east-1",
+			CollectorSecurityGroupID:      "sg-ours",
+			CollectorSecurityGroupCreated: true,
+		})
+		if len(*released) != 1 || (*released)[0] != "sg-ours" {
+			t.Errorf("released %v, want [sg-ours]", *released)
+		}
+	})
+
+	t.Run("pre-existing", func(t *testing.T) {
+		isolate(t)
+		released := stubReleaseCollectorSG(t, nil)
+		releaseCollectorSecurityGroup(context.Background(), &collector.State{
+			Target: "aws", Region: "us-east-1",
+			CollectorSecurityGroupID:      "sg-theirs",
+			CollectorSecurityGroupCreated: false,
+		})
+		if len(*released) != 0 {
+			t.Errorf("removed a group the install did not create: %v", *released)
+		}
+	})
+
+	t.Run("no security group at all", func(t *testing.T) {
+		isolate(t)
+		released := stubReleaseCollectorSG(t, nil)
+		releaseCollectorSecurityGroup(context.Background(), &collector.State{Target: "aws", Region: "us-east-1"})
+		if len(*released) != 0 {
+			t.Errorf("nothing to release, got %v", *released)
+		}
+	})
+
+	// The task's interface usually still holds the group when uninstall runs,
+	// so this is the ordinary case rather than an edge one. It must report,
+	// not block or claim success.
+	t.Run("still in use is reported", func(t *testing.T) {
+		isolate(t)
+		released := stubReleaseCollectorSG(t, errors.New("DependencyViolation: resource sg-ours has a dependent object"))
+		releaseCollectorSecurityGroup(context.Background(), &collector.State{
+			Target: "aws", Region: "us-east-1",
+			CollectorSecurityGroupID:      "sg-ours",
+			CollectorSecurityGroupCreated: true,
+		})
+		if len(*released) != 1 {
+			t.Errorf("the delete should still have been attempted, got %v", *released)
+		}
+	})
 }

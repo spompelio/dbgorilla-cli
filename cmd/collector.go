@@ -1532,6 +1532,30 @@ var uninstallCmd = &cobra.Command{
 	RunE:  runUninstall,
 }
 
+// releaseCollectorSecurityGroup removes the security group the install created
+// for a VPC-resident collector. A group that already existed is left alone.
+//
+// The stack deletion above is asynchronous, so the task's network interface
+// usually still holds the group at this point and EC2 refuses. That is reported
+// with the one command that finishes the job rather than retried: blocking
+// uninstall for the minutes a stack takes to drain is worse than a line of
+// output, and the group costs nothing while it waits.
+func releaseCollectorSecurityGroup(ctx context.Context, st *collector.State) {
+	if !st.CollectorSecurityGroupCreated || st.CollectorSecurityGroupID == "" {
+		return
+	}
+	err := releaseCollectorSG(ctx, st.Region, st.CollectorSecurityGroupID)
+	if err == nil {
+		fmt.Println(style.Success(fmt.Sprintf("✓ Collector security group %s removed", st.CollectorSecurityGroupID)))
+		return
+	}
+	fmt.Println(style.Warn(fmt.Sprintf("⚠  The collector security group %s could not be removed yet: %v",
+		st.CollectorSecurityGroupID, err)))
+	fmt.Printf("   Once the stack has finished deleting, remove it with:\n"+
+		"     aws ec2 delete-security-group --group-id %s --region %s\n",
+		st.CollectorSecurityGroupID, st.Region)
+}
+
 func runUninstall(cmd *cobra.Command, _ []string) error {
 	st, err := collector.LoadState()
 	if err != nil {
@@ -1558,6 +1582,7 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 		} else {
 			fmt.Println(style.Success(fmt.Sprintf("✓ Stack %s deletion started", st.StackName)))
 		}
+		releaseCollectorSecurityGroup(cmd.Context(), st)
 	} else if st.IsGCP() {
 		// Infrastructure Manager answers only once the resources are destroyed.
 		err := withSpinner("Deleting the deployment…", func() error {

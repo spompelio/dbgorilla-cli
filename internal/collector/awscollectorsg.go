@@ -184,3 +184,22 @@ func awsErrorCodeIs(err error, code string) bool {
 	}
 	return strings.Contains(err.Error(), code)
 }
+
+// ReleaseCollectorSecurityGroup removes a collector security group by id,
+// resolving its own EC2 client for the region.
+//
+// Uninstall calls this straight after starting the stack deletion, which is
+// asynchronous — so the task's network interface may still hold the group and
+// EC2 refuses with DependencyViolation. That refusal is returned as-is rather
+// than retried here: uninstall should report it and move on, not block for the
+// minutes a stack takes to drain.
+func ReleaseCollectorSecurityGroup(ctx context.Context, region, groupID string) error {
+	if groupID == "" {
+		return nil
+	}
+	cfg, err := loadAWSConfig(ctx, region)
+	if err != nil {
+		return err
+	}
+	return DeleteCollectorSecurityGroup(ctx, ec2.NewFromConfig(cfg), groupID)
+}

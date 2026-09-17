@@ -163,3 +163,68 @@ func TestRefreshFirewallKeepsCIDRRuleOwnershipOnANoOpRefresh(t *testing.T) {
 		t.Errorf("ownership of r-ours was dropped on a no-op refresh, state has %q", st.FirewallRuleID)
 	}
 }
+
+// A collector on the fallback path is reconciled by re-asserting its networks,
+// never by detecting an address — its address is inside the VPC and is not what
+// the cluster sees.
+func TestRefreshFirewallReassertsSubnetRules(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID: "a-1", Target: "aws", StackName: "s", Region: "us-east-1",
+		InstaclustrClusterID:     "c-1",
+		InstaclustrUsername:      "someone",
+		CollectorSubnetCIDRs:     []string{"10.10.0.0/18", "10.10.64.0/18"},
+		CollectorFirewallRuleIDs: []string{"r-a", "r-b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	stubPublicEgressIP(t, "192.0.2.9", errors.New("must not detect an address for a subnet allowlist"))
+	stubStackOutput(t, "", errors.New("must not read the stack egress IP for a subnet allowlist"))
+
+	var seen []string
+	orig := ensureFirewallRule
+	ensureFirewallRule = func(_ context.Context, _ collector.InstaclustrCreds, _, cidr string) (collector.FirewallRule, bool, error) {
+		seen = append(seen, cidr)
+		// Already present, as on an ordinary no-op refresh.
+		return collector.FirewallRule{ID: map[string]string{
+			"10.10.0.0/18": "r-a", "10.10.64.0/18": "r-b",
+		}[cidr], Network: cidr}, false, nil
+	}
+	t.Cleanup(func() { ensureFirewallRule = orig })
+
+	if err := runRefreshFirewall(refreshFirewallCmd, nil); err != nil {
+		t.Fatalf("runRefreshFirewall: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("re-asserted %v, want both subnets", seen)
+	}
+	st, err := collector.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ownership must survive a no-op refresh on this path too.
+	if len(st.CollectorFirewallRuleIDs) != 2 {
+		t.Errorf("ownership dropped on a no-op refresh: %v", st.CollectorFirewallRuleIDs)
+	}
+}
+
+func TestRefreshFirewallRefusesAllowIPOnTheSubnetPath(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{
+		AgentID: "a-1", Target: "aws", InstaclustrClusterID: "c-1", InstaclustrUsername: "someone",
+		CollectorSubnetCIDRs: []string{"10.10.0.0/18"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(instaclustrProvisioningEnv, "key123")
+	if err := refreshFirewallCmd.Flags().Set("allow-ip", "192.0.2.9"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = refreshFirewallCmd.Flags().Set("allow-ip", "") })
+
+	err := runRefreshFirewall(refreshFirewallCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "10.10.0.0/18") {
+		t.Fatalf("expected a refusal naming the subnets, got %v", err)
+	}
+}

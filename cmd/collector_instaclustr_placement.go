@@ -208,10 +208,13 @@ func allowlistCollectorSecurityGroup(
 ) error {
 	rule, created, err := ensureSGRule(ctx, in.setupCreds, in.clusterID, p.securityGroup)
 	if err != nil {
-		removeOperatorRule()
-		return fmt.Errorf("the collector deployed but its firewall entry failed: %w\n\n"+
-			"Allowlist security group %s on the cluster's Firewall Rules page, or re-run "+
-			"`dbg collector refresh-firewall`", err, p.securityGroup)
+		// The security-group entry is the better one — it survives a redeploy —
+		// but it is not the only one the cluster can express. An account or
+		// region that will not take a same-VPC group still needs the collector
+		// admitted, and its subnets are a network the firewall understands.
+		fmt.Println(style.Warn(fmt.Sprintf(
+			"⚠  The cluster would not accept a security-group firewall rule (%v).", err)))
+		return allowlistCollectorSubnets(ctx, in, p, removeOperatorRule)
 	}
 	fmt.Println(style.Success(fmt.Sprintf("✓ Firewall: allowlisted security group %s for the collector",
 		p.securityGroup)))
@@ -234,6 +237,64 @@ func allowlistCollectorSecurityGroup(
 	}
 	if serr := collector.SaveState(st); serr != nil {
 		fmt.Println(style.Warn(fmt.Sprintf("⚠  could not record the firewall rule id: %v", serr)))
+	}
+	return nil
+}
+
+// allowlistCollectorSubnets admits the collector by the networks its task can
+// land in, for a cluster that will not take a security-group rule.
+//
+// Every candidate subnet is allowlisted rather than one: the task goes wherever
+// the scheduler places it, and that changes between deployments. Which kind of
+// entry was used is recorded, because the two reconcile differently — and
+// neither reconciles by detecting an address, which for a collector inside the
+// VPC would name a host the cluster never sees.
+func allowlistCollectorSubnets(
+	ctx context.Context, in *instaclustrInstall, p *awsPlacement, removeOperatorRule func(),
+) error {
+	if p.vpc == nil || len(p.vpc.CIDRs()) == 0 {
+		removeOperatorRule()
+		return errors.New("the collector deployed but its firewall entry failed, and its subnets report no " +
+			"network to fall back to. Allowlist the collector's subnet on the cluster's Firewall Rules page")
+	}
+
+	var cidrs, ruleIDs []string
+	for _, raw := range p.vpc.CIDRs() {
+		cidr, cerr := collector.AllowCIDR(raw)
+		if cerr != nil {
+			removeOperatorRule()
+			return cerr
+		}
+		rule, created, rerr := ensureFirewallRule(ctx, in.setupCreds, in.clusterID, cidr)
+		if rerr != nil {
+			removeOperatorRule()
+			return fmt.Errorf("the collector deployed but its firewall entry failed: %w\n\n"+
+				"Allowlist %s on the cluster's Firewall Rules page, or re-run "+
+				"`dbg collector refresh-firewall`", rerr, cidr)
+		}
+		cidrs = append(cidrs, cidr)
+		if created {
+			ruleIDs = append(ruleIDs, rule.ID)
+		}
+	}
+	fmt.Println(style.Success(fmt.Sprintf("✓ Firewall: allowlisted the collector's subnets (%s)",
+		strings.Join(cidrs, ", "))))
+	removeOperatorRule()
+
+	st, lerr := collector.LoadState()
+	if lerr != nil || st == nil {
+		return nil
+	}
+	st.CollectorSubnetCIDRs = cidrs
+	st.CollectorFirewallRuleIDs = ruleIDs
+	// The group still exists and the task still uses it for egress; the cluster
+	// simply would not name it. Leaving the id unset keeps refresh-firewall on
+	// the subnet path, while the created flag still gets the group cleaned up.
+	if p.vpc.SecurityGroupCreated {
+		st.CollectorSecurityGroupCreated = true
+	}
+	if serr := collector.SaveState(st); serr != nil {
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  could not record the firewall rule ids: %v", serr)))
 	}
 	return nil
 }

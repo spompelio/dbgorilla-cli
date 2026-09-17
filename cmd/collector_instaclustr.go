@@ -829,6 +829,17 @@ func runRefreshFirewall(cmd *cobra.Command, _ []string) error {
 		}
 		return refreshSecurityGroupRule(ctx, st, creds)
 	}
+	// The fallback shape: allowlisted by the networks its task can land in.
+	// Those do not move either, so there is still no address to detect — and
+	// detecting one would name this machine rather than a host inside the VPC.
+	if len(st.CollectorSubnetCIDRs) > 0 {
+		if allowRaw != "" {
+			return fmt.Errorf("this collector is allowlisted by its subnets (%s), so --allow-ip does not apply: "+
+				"it runs inside the cluster's VPC, where its address is not what the cluster sees",
+				strings.Join(st.CollectorSubnetCIDRs, ", "))
+		}
+		return refreshSubnetRules(ctx, st, creds)
+	}
 	if allowRaw == "" {
 		switch {
 		case st.IsAWS():
@@ -936,6 +947,52 @@ func refreshSecurityGroupRule(ctx context.Context, st *collector.State, creds co
 		return collector.SaveState(st)
 	}
 	return nil
+}
+
+// refreshSubnetRules re-asserts the collector's subnet allowlist entries.
+//
+// Like the security-group path there is nothing to re-detect: the subnets a
+// task can land in are fixed by the placement. This only puts back an entry
+// something removed out of band, and records ownership of anything it creates.
+func refreshSubnetRules(ctx context.Context, st *collector.State, creds collector.InstaclustrCreds) error {
+	owned := make(map[string]bool, len(st.CollectorFirewallRuleIDs))
+	for _, id := range st.CollectorFirewallRuleIDs {
+		owned[id] = true
+	}
+	var ruleIDs []string
+	for _, cidr := range st.CollectorSubnetCIDRs {
+		rule, created, err := ensureFirewallRule(ctx, creds, st.InstaclustrClusterID, cidr)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Println(style.Success(fmt.Sprintf("✓ Re-allowlisted %s", cidr)))
+		} else {
+			fmt.Println(style.Success(fmt.Sprintf("✓ %s already allowlisted", cidr)))
+		}
+		// Ownership survives a no-op refresh: a rule we created and re-asserted
+		// comes back as created=false, and forgetting it would orphan it.
+		if created || owned[rule.ID] {
+			ruleIDs = append(ruleIDs, rule.ID)
+		}
+	}
+	if !sameStrings(st.CollectorFirewallRuleIDs, ruleIDs) {
+		st.CollectorFirewallRuleIDs = ruleIDs
+		return collector.SaveState(st)
+	}
+	return nil
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // --- the aws substrate ------------------------------------------------------

@@ -93,6 +93,16 @@ type State struct {
 	// CollectorSecurityGroupCreated records that the install made the group,
 	// so uninstall removes only a group this CLI is responsible for.
 	CollectorSecurityGroupCreated bool `json:"collector_security_group_created,omitempty"`
+	// CollectorSubnetCIDRs is the fallback: the networks a VPC-resident
+	// collector was allowlisted by when the security-group rule could not be
+	// used. It selects that mode the way CollectorSecurityGroupID selects the
+	// other, so refresh-firewall re-asserts these networks rather than
+	// detecting an address — the task's address is inside the VPC and means
+	// nothing to the address-detection path.
+	CollectorSubnetCIDRs []string `json:"collector_subnet_cidrs,omitempty"`
+	// CollectorFirewallRuleIDs are the rules the install created for those
+	// networks, empty for any that already existed.
+	CollectorFirewallRuleIDs []string `json:"collector_firewall_rule_ids,omitempty"`
 
 	// gcp target (Region above is shared with aws).
 	Project        string `json:"project,omitempty"`

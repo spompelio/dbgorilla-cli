@@ -269,3 +269,85 @@ func TestUninstallReleasesOnlyASecurityGroupItCreated(t *testing.T) {
 		}
 	})
 }
+
+// The fallback: a cluster that will not take a security-group rule still has to
+// admit the collector, by the networks its task can land in.
+func TestInstallFallsBackToSubnetCIDRs(t *testing.T) {
+	isolate(t)
+	if err := collector.SaveState(&collector.State{AgentID: "a-1", Target: "aws"}); err != nil {
+		t.Fatal(err)
+	}
+	// The cluster refuses the security-group entry.
+	origSG := ensureSGRule
+	ensureSGRule = func(_ context.Context, _ collector.InstaclustrCreds, _, _ string) (collector.SecurityGroupRule, bool, error) {
+		return collector.SecurityGroupRule{}, false, errors.New("security group rules are not available here")
+	}
+	t.Cleanup(func() { ensureSGRule = origSG })
+
+	var seen []string
+	origCIDR := ensureFirewallRule
+	ensureFirewallRule = func(_ context.Context, _ collector.InstaclustrCreds, _, cidr string) (collector.FirewallRule, bool, error) {
+		seen = append(seen, cidr)
+		return collector.FirewallRule{ID: "r-" + cidr, Network: cidr}, true, nil
+	}
+	t.Cleanup(func() { ensureFirewallRule = origCIDR })
+
+	removed := false
+	p := &awsPlacement{securityGroup: "sg-ours", vpc: &collector.VPCPlacement{
+		VpcID: "vpc-1", SecurityGroupCreated: true,
+		Subnets: []collector.CollectorSubnet{
+			{ID: "subnet-a", CIDR: "10.10.0.0/18"},
+			{ID: "subnet-b", CIDR: "10.10.64.0/18"},
+		},
+	}}
+	in := &instaclustrInstall{clusterID: "c-1"}
+
+	if err := allowlistCollectorSecurityGroup(context.Background(), in, p, false, func() { removed = true }); err != nil {
+		t.Fatalf("the fallback should have admitted the collector: %v", err)
+	}
+	// Every candidate subnet, because the scheduler picks which one.
+	if len(seen) != 2 || seen[0] != "10.10.0.0/18" || seen[1] != "10.10.64.0/18" {
+		t.Errorf("allowlisted %v, want both subnet CIDRs", seen)
+	}
+	if !removed {
+		t.Error("the operator's temporary rule must still be retired")
+	}
+
+	st, err := collector.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.CollectorSubnetCIDRs) != 2 {
+		t.Errorf("CollectorSubnetCIDRs = %v, want both recorded", st.CollectorSubnetCIDRs)
+	}
+	if len(st.CollectorFirewallRuleIDs) != 2 {
+		t.Errorf("CollectorFirewallRuleIDs = %v, want both recorded", st.CollectorFirewallRuleIDs)
+	}
+	// Which kind was used decides how refresh-firewall reconciles: leaving the
+	// security-group id set would send it down the wrong path.
+	if st.CollectorSecurityGroupID != "" {
+		t.Errorf("CollectorSecurityGroupID = %q, want empty on the fallback path", st.CollectorSecurityGroupID)
+	}
+	// The group still exists and the task still uses it for egress, so
+	// uninstall must still clean it up.
+	if !st.CollectorSecurityGroupCreated {
+		t.Error("the security group this run created must still be released at uninstall")
+	}
+}
+
+// Subnets reporting no network leave nothing to fall back to, and that has to
+// be said rather than silently leaving the collector unable to connect.
+func TestFallbackRefusesWhenThereIsNoNetwork(t *testing.T) {
+	isolate(t)
+	origSG := ensureSGRule
+	ensureSGRule = func(_ context.Context, _ collector.InstaclustrCreds, _, _ string) (collector.SecurityGroupRule, bool, error) {
+		return collector.SecurityGroupRule{}, false, errors.New("refused")
+	}
+	t.Cleanup(func() { ensureSGRule = origSG })
+
+	p := &awsPlacement{securityGroup: "sg-ours", vpc: &collector.VPCPlacement{VpcID: "vpc-1"}}
+	err := allowlistCollectorSecurityGroup(context.Background(), &instaclustrInstall{clusterID: "c-1"}, p, false, func() {})
+	if err == nil || !strings.Contains(err.Error(), "no") {
+		t.Fatalf("expected a refusal naming the missing network, got %v", err)
+	}
+}

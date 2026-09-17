@@ -22,7 +22,7 @@ func byocTarget() collector.InstaclustrTarget {
 func stubVPCPlacement(t *testing.T, p collector.VPCPlacement, problems []collector.PlacementProblem, err error) {
 	t.Helper()
 	orig := discoverVPCPlacement
-	discoverVPCPlacement = func(_ context.Context, _, _ string) (collector.VPCPlacement, []collector.PlacementProblem, error) {
+	discoverVPCPlacement = func(_ context.Context, _, _ string, _ []string) (collector.VPCPlacement, []collector.PlacementProblem, error) {
 		return p, problems, err
 	}
 	t.Cleanup(func() { discoverVPCPlacement = orig })

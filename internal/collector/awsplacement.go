@@ -216,7 +216,7 @@ func (p VPCPlacement) AssignPublicIP() string {
 // DiscoverVPCPlacement finds where the collector can run inside vpcID and
 // checks it. It creates nothing — every call is a describe — so a refusal here
 // leaves the account untouched.
-func DiscoverVPCPlacement(ctx context.Context, region, vpcID string) (VPCPlacement, []PlacementProblem, error) {
+func DiscoverVPCPlacement(ctx context.Context, region, vpcID string, nodeAddresses []string) (VPCPlacement, []PlacementProblem, error) {
 	cfg, err := loadAWSConfig(ctx, region)
 	if err != nil {
 		return VPCPlacement{}, nil, err
@@ -227,7 +227,11 @@ func DiscoverVPCPlacement(ctx context.Context, region, vpcID string) (VPCPlaceme
 	if err != nil {
 		return VPCPlacement{}, nil, err
 	}
-	usable := RoutableSubnets(all)
+	// Narrow to where the database actually lives before judging the placement:
+	// a VPC can hold infrastructure subnets that route differently and would
+	// otherwise decide both the placement and whether a public address is
+	// needed.
+	usable := RoutableSubnets(SubnetsHostingNodes(all, nodeAddresses))
 	if len(usable) == 0 {
 		// Report against everything found, so the problem names the subnets the
 		// operator can actually see in the console.

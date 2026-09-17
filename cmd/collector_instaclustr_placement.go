@@ -141,7 +141,15 @@ func resolveVPCResidentPlacement(
 		}
 	}
 
-	placement, problems, err := discoverVPCPlacement(ctx, region, ict.VpcID)
+	// The nodes' own addresses decide where the collector belongs; without them
+	// an infrastructure subnet can win the placement.
+	nodeAddrs := make([]string, 0, len(ict.Nodes))
+	for _, n := range ict.Nodes {
+		if n.PrivateAddress != "" {
+			nodeAddrs = append(nodeAddrs, n.PrivateAddress)
+		}
+	}
+	placement, problems, err := discoverVPCPlacement(ctx, region, ict.VpcID, nodeAddrs)
 	if err != nil {
 		return nil, err
 	}

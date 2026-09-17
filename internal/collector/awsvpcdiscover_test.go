@@ -209,3 +209,46 @@ func TestSubnetIDsAndRoutableOrderIsStable(t *testing.T) {
 		t.Errorf("got %v, want [subnet-a subnet-c] in discovery order", got)
 	}
 }
+
+// A VPC holds more than the database. Instaclustr's private-network shape adds
+// a small public subnet for the NAT gateway; placing the collector there would
+// put it in a /28 of infrastructure and force a public address on a task whose
+// point is to reach the database privately.
+func TestSubnetsHostingNodesExcludesInfrastructure(t *testing.T) {
+	// The shape the live private-network cluster actually has.
+	all := []CollectorSubnet{
+		{ID: "subnet-nat", CIDR: "10.20.128.0/28", InternetRoute: "igw-1", NeedsPublicIP: true},
+		{ID: "subnet-b", CIDR: "10.20.64.0/18", InternetRoute: "nat-1"},
+		{ID: "subnet-a", CIDR: "10.20.0.0/18", InternetRoute: "nat-1"},
+	}
+	got := SubnetsHostingNodes(all, []string{"10.20.5.47", "10.20.68.76"})
+
+	if len(got) != 2 {
+		t.Fatalf("got %d subnets, want the two the nodes are in: %v", len(got), SubnetIDs(got))
+	}
+	for _, s := range got {
+		if s.ID == "subnet-nat" {
+			t.Error("the NAT gateway's /28 is infrastructure, not a placement")
+		}
+	}
+	// With the infrastructure subnet gone, nothing forces a public address.
+	if p := (VPCPlacement{Subnets: got}).AssignPublicIP(); p != "DISABLED" {
+		t.Errorf("AssignPublicIP = %q, want DISABLED — both node subnets route through a NAT", p)
+	}
+	// And with it present, it would have.
+	if p := (VPCPlacement{Subnets: all}).AssignPublicIP(); p != "ENABLED" {
+		t.Errorf("sanity: the unfiltered set should have forced ENABLED, got %q", p)
+	}
+}
+
+// Losing every subnet is worse than a broad placement, so a set that matches
+// nothing comes back unchanged.
+func TestSubnetsHostingNodesFallsBackRatherThanEmptying(t *testing.T) {
+	all := []CollectorSubnet{{ID: "subnet-a", CIDR: "10.10.0.0/18", InternetRoute: "igw-1"}}
+	if got := SubnetsHostingNodes(all, []string{"192.0.2.7"}); len(got) != 1 {
+		t.Errorf("got %v, want the original set when nothing matches", SubnetIDs(got))
+	}
+	if got := SubnetsHostingNodes(all, nil); len(got) != 1 {
+		t.Errorf("got %v, want the original set with no node addresses", SubnetIDs(got))
+	}
+}

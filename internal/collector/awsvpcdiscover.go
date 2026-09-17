@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -149,6 +150,48 @@ func SubnetIDs(in []CollectorSubnet) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
 		out = append(out, s.ID)
+	}
+	return out
+}
+
+// SubnetsHostingNodes narrows a discovered set to the subnets the cluster's own
+// nodes sit in.
+//
+// A VPC contains more than the database. Instaclustr's private-network shape
+// adds a small public subnet to hold the NAT gateway, and placing the collector
+// there would be wrong twice over: it is infrastructure rather than a workload
+// subnet — a /28 with sixteen addresses, which a task could exhaust — and it
+// routes through the internet gateway, which would force a public address on a
+// task whose whole point is to reach the database privately.
+//
+// The nodes' own addresses are the signal: wherever they are is where a
+// collector belongs. A set that matches nothing is returned unchanged rather
+// than emptied, since having no placement at all is worse than a broad one.
+func SubnetsHostingNodes(subnets []CollectorSubnet, nodeAddresses []string) []CollectorSubnet {
+	ips := make([]net.IP, 0, len(nodeAddresses))
+	for _, a := range nodeAddresses {
+		if ip := net.ParseIP(a); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return subnets
+	}
+	out := make([]CollectorSubnet, 0, len(subnets))
+	for _, s := range subnets {
+		_, network, err := net.ParseCIDR(s.CIDR)
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			if network.Contains(ip) {
+				out = append(out, s)
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return subnets
 	}
 	return out
 }

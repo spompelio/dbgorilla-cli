@@ -641,11 +641,16 @@ func describeInstaclustrShape(ict collector.InstaclustrTarget, usePrivate bool) 
 	if ict.PrivateNetworkCluster {
 		network = "a private network, with no public addresses"
 	}
+	// Say whose dial this is. This line is printed before the deploy placement
+	// is resolved, and on a cluster with public addresses the collector may
+	// still end up on the private side once it is placed inside the cluster's
+	// VPC — so claiming "dialling private addresses" here would contradict the
+	// placement line that follows moments later.
 	side := "public"
 	if usePrivate {
 		side = "private"
 	}
-	out := fmt.Sprintf("Runs in %s on %s — dialling %s addresses", residency, network, side)
+	out := fmt.Sprintf("Runs in %s on %s — setup dials %s addresses", residency, network, side)
 	// The network blocks do not depend on a VPC id being reported: a
 	// private-network cluster in Instaclustr's own account has blocks and no
 	// VPC id, and those are exactly the clusters whose route warning names them.

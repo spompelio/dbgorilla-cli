@@ -351,3 +351,19 @@ func TestFallbackRefusesWhenThereIsNoNetwork(t *testing.T) {
 		t.Fatalf("expected a refusal naming the missing network, got %v", err)
 	}
 }
+
+// The shape line is printed before the deploy placement is resolved. On a
+// cluster that has public addresses, the collector can still end up on the
+// private side once it is placed inside the cluster's VPC — so this line must
+// describe the setup connection, not claim a side the placement then overrides.
+func TestShapeLineDoesNotClaimTheCollectorsSide(t *testing.T) {
+	line := describeInstaclustrShape(byocTarget(), false)
+	if !strings.Contains(line, "setup dials public addresses") {
+		t.Errorf("got %q, want it scoped to the setup connection", line)
+	}
+	// The placement line is the one that speaks for the collector, and the two
+	// appear together in the output.
+	if strings.Contains(line, "dialling") {
+		t.Errorf("the shape line must not read as the collector's dial: %q", line)
+	}
+}

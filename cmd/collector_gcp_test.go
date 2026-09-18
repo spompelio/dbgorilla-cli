@@ -28,6 +28,118 @@ func stubGCPOK(t *testing.T) {
 	stubResolveGcpSubnetwork(t, "", nil)
 	stubGcpSubnetworkPGA(t, true, nil)
 	stubRemoteDigest(t, nil)
+	stubWaitGcpMigStable(t, nil)
+}
+
+// --- update / upgrade seams -------------------------------------------------
+
+func stubReadGcpDeployment(t *testing.T, spec *collector.GcpDeploymentSpec, err error) *int {
+	t.Helper()
+	calls := new(int)
+	orig := readGcpDeployment
+	readGcpDeployment = func(string, string, string) (*collector.GcpDeploymentSpec, error) {
+		*calls++
+		return spec, err
+	}
+	t.Cleanup(func() { readGcpDeployment = orig })
+	return calls
+}
+
+func stubUpgradeGcpImage(t *testing.T, err error) *[]string {
+	t.Helper()
+	images := new([]string)
+	orig := upgradeGcpImage
+	upgradeGcpImage = func(project, region, name, image string) error {
+		if project != "acme-prod" || region != "us-central1" || name != "dbg-test" {
+			t.Errorf("upgrade addressed %s/%s/%s", project, region, name)
+		}
+		*images = append(*images, image)
+		return err
+	}
+	t.Cleanup(func() { upgradeGcpImage = orig })
+	return images
+}
+
+func stubWaitGcpMigStable(t *testing.T, err error) *int {
+	t.Helper()
+	calls := new(int)
+	orig := waitGcpMigStable
+	waitGcpMigStable = func(string, string, string) error { *calls++; return err }
+	t.Cleanup(func() { waitGcpMigStable = orig })
+	return calls
+}
+
+func stubEnsureGcpDBPassword(t *testing.T, err error) *[]string {
+	t.Helper()
+	passwords := new([]string)
+	orig := ensureGcpDBPassword
+	ensureGcpDBPassword = func(_, _ string, password string) error {
+		*passwords = append(*passwords, password)
+		return err
+	}
+	t.Cleanup(func() { ensureGcpDBPassword = orig })
+	return passwords
+}
+
+// storedGcpConfig renders the collector.toml an earlier install stored on the
+// deployment: identity agent-old/tenant-old, its own endpoints, one target.
+func storedGcpConfig(t *testing.T, target collector.GcpTarget) string {
+	t.Helper()
+	cfg, err := collector.GcpConfigTOML("agent-old", "tenant-old", []collector.GcpTarget{target}, collector.Endpoints{
+		OpampBaseURL: "https://opamp.example", OtlpBaseURL: "https://otlp.example:4318", AuthBaseURL: "https://auth.example",
+	}, true)
+	if err != nil {
+		t.Fatalf("render stored config: %v", err)
+	}
+	return cfg
+}
+
+// deployedGcpSpec is a deployment as an earlier CLI applied it: template
+// v1.3 (database_roles, no login_instances), its own networking and image.
+func deployedGcpSpec(t *testing.T, configTOML, templateVersion string) *collector.GcpDeploymentSpec {
+	t.Helper()
+	encoded, err := collector.EncodeConfig(configTOML)
+	if err != nil {
+		t.Fatalf("encode stored config: %v", err)
+	}
+	return &collector.GcpDeploymentSpec{
+		State:          "ACTIVE",
+		TemplateSource: "gs://dbgorilla-collector-templates/collector/gce/" + templateVersion,
+		ServiceAccount: "projects/acme-prod/serviceAccounts/deployer@acme-prod.iam.gserviceaccount.com",
+		Inputs: map[string]string{
+			"collector_config":        encoded,
+			"collector_image":         "example.registry/collector@sha256:old",
+			"database_roles":          "true",
+			"nat_subnet_cidr":         "",
+			"network":                 "projects/acme-prod/global/networks/prod-vpc",
+			"region":                  "us-central1",
+			"runtime_service_account": "dbg-test@acme-prod.iam.gserviceaccount.com",
+			"stable_egress":           "false",
+			"subnetwork":              "projects/acme-prod/regions/us-central1/subnetworks/prod-subnet",
+		},
+	}
+}
+
+// installedGcpTarget is completeGcpTarget as the earlier install settled it:
+// IAM auth, one database, one command.
+func installedGcpTarget() collector.GcpTarget {
+	t := completeGcpTarget()
+	t.Replicas = nil // the replica appeared after the install
+	t.AuthMethod = "gcp_iam"
+	t.User = "dbg-test@acme-prod.iam"
+	t.Databases = []string{"app"}
+	t.Commands = []string{"explain"}
+	return t
+}
+
+func saveGcpState(t *testing.T, image string) *collector.State {
+	t.Helper()
+	st := &collector.State{AgentID: "agent-old", TenantID: "tenant-old", Target: "gcp", Image: image,
+		TargetName: "prod-pg", Project: "acme-prod", Region: "us-central1", DeploymentName: "dbg-test"}
+	if err := collector.SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 func stubResolveGcpSubnetwork(t *testing.T, subnetwork string, err error) {
@@ -176,6 +288,7 @@ func gcpCmd(t *testing.T) *cobra.Command {
 	c.Flags().String("network", "", "")
 	c.Flags().String("subnetwork", "", "")
 	c.Flags().Bool("allow-project-wide-login", false, "")
+	c.Flags().Bool("allow-downgrade", false, "")
 	c.SetContext(context.Background())
 	return c
 }
@@ -565,16 +678,61 @@ func TestRunInstallGCP_PriorInstall(t *testing.T) {
 		}
 	})
 
-	t.Run("a live deployment is refused until uninstall", func(t *testing.T) {
+	t.Run("a live deployment is updated in place", func(t *testing.T) {
 		c := setup(t)
-		if err := collector.SaveState(&collector.State{AgentID: "agent-old", Target: "gcp", Project: "acme-prod", Region: "us-central1", DeploymentName: "dbg-test"}); err != nil {
-			t.Fatal(err)
-		}
+		saveGcpState(t, "example.registry/collector@sha256:old")
 		stubGcpDeploymentStatus(t, "ACTIVE", nil)
+		stubReadGcpDeployment(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.3"), nil)
+		deploys := stubGcpDeploy(t, nil)
 		var err error
-		capture(t, func() { err = runInstallGCP(c) })
-		if err == nil || !strings.Contains(err.Error(), "dbg collector uninstall") || !strings.Contains(err.Error(), "ACTIVE") {
-			t.Fatalf("err = %v, want the uninstall hint with the state", err)
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if deploys.count != 1 || !deploys.deploy.RequireExisting {
+			t.Fatalf("want one update of the existing deployment, got %+v", deploys)
+		}
+		d := deploys.deploy
+		// The deployment's own values carry through: actuating account,
+		// networking, image. Only the template moves — to this CLI's.
+		if d.ServiceAccount != "projects/acme-prod/serviceAccounts/deployer@acme-prod.iam.gserviceaccount.com" {
+			t.Errorf("actuating account = %q", d.ServiceAccount)
+		}
+		if d.Inputs["network"] != "projects/acme-prod/global/networks/prod-vpc" ||
+			d.Inputs["subnetwork"] != "projects/acme-prod/regions/us-central1/subnetworks/prod-subnet" ||
+			d.Inputs["collector_image"] != "example.registry/collector@sha256:old" {
+			t.Errorf("networking and image must come from the deployment, got %v", d.Inputs)
+		}
+		if d.TemplateSource != collector.HostedGcpTemplateSource() || !strings.Contains(out, "Moving the deployment from template v1.3 to "+collector.GcpTemplateVersion) {
+			t.Errorf("a v1.3 deployment moves to this CLI's template, got %s:\n%s", d.TemplateSource, out)
+		}
+		if _, stale := d.Inputs["database_roles"]; stale || d.Inputs["login_instances"] != "prod-pg,prod-pg-replica" {
+			t.Errorf("inputs must be the current contract with the new replica in the login condition, got %v", d.Inputs)
+		}
+		// Identity, endpoints and commands are read back, never re-minted;
+		// the databases and commands the install settled survive.
+		cfg := decodedConfig(t, d)
+		for _, want := range []string{`agent_id = "agent-old"`, `tenant_id = "tenant-old"`, `opamp_base_url = "https://opamp.example"`,
+			`otlp_base_url = "https://otlp.example:4318"`, `databases = ["app"]`, `commands = ["explain"]`, `enabled = true`, `method = "gcp_iam"`} {
+			if !strings.Contains(cfg, want) {
+				t.Errorf("config missing %s:\n%s", want, cfg)
+			}
+		}
+		if strings.Contains(cfg, "agent-new") {
+			t.Error("an update must not mint a new identity")
+		}
+		if deploys.secretsWritten != 0 {
+			t.Error("an update without a new password touches no secret")
+		}
+		st, _ := collector.LoadState()
+		if st == nil || st.AgentID != "agent-old" || st.TargetName != "prod-pg" {
+			t.Errorf("state = %+v", st)
+		}
+		if !strings.Contains(out, "Collector updated") || !strings.Contains(out, "rolled to the new configuration") {
+			t.Errorf("the update and the rollout should be reported, got:\n%s", out)
+		}
+		if strings.Contains(out, "gcloud sql users create") {
+			t.Errorf("the same target under the same auth needs no new grant, got:\n%s", out)
 		}
 	})
 
@@ -1127,12 +1285,293 @@ func TestCollectorLifecycle_GCPRoutesToTheInstanceGroup(t *testing.T) {
 			t.Errorf("logs addressed %s/%s", gotProject, gotName)
 		}
 	})
-	t.Run("upgrade refuses with the workaround", func(t *testing.T) {
-		saveGCP(t)
-		c := gcpCmd(t)
-		err := runCollectorUpgrade(c, nil)
-		if err == nil || !strings.Contains(err.Error(), "dbg collector uninstall") {
+}
+
+// --- update -------------------------------------------------------------------
+
+func setupGcpUpdate(t *testing.T, spec *collector.GcpDeploymentSpec, discovered collector.GcpTarget) (*cobra.Command, *gcpDeployCall) {
+	t.Helper()
+	isolate(t)
+	writeTokens(t)
+	stubGCPOK(t)
+	saveGcpState(t, "example.registry/collector@sha256:old")
+	stubGcpDeploymentStatus(t, "ACTIVE", nil)
+	stubReadGcpDeployment(t, spec, nil)
+	stubGcpDiscover(t, discovered, nil)
+	deploys := stubGcpDeploy(t, nil)
+	srv := installServer(t, "agent-new")
+	t.Cleanup(srv.Close)
+	c := gcpCmd(t)
+	mustSet(t, c, "api-url", srv.URL)
+	mustSet(t, c, "yes", "true")
+	return c, deploys
+}
+
+func TestRunUpdateGCP_Refusals(t *testing.T) {
+	iamSpec := func(t *testing.T) *collector.GcpDeploymentSpec {
+		return deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.3")
+	}
+	cases := []struct {
+		name  string
+		spec  func(t *testing.T) *collector.GcpDeploymentSpec
+		flags map[string]string
+		want  string
+	}{
+		{"networking cannot change in place", iamSpec, map[string]string{"network": "projects/acme-prod/global/networks/other"}, "cannot change an installed collector in place"},
+		{"the deploy account cannot change in place", iamSpec, map[string]string{"deploy-service-account": "projects/acme-prod/serviceAccounts/x@acme-prod.iam.gserviceaccount.com"}, "cannot change an installed collector in place"},
+		{"the subnetwork cannot change in place", iamSpec, map[string]string{"subnetwork": "projects/acme-prod/regions/us-central1/subnetworks/other"}, "cannot change an installed collector in place"},
+		{"another project is another collector", iamSpec, map[string]string{"project": "other-proj"}, "cannot move it in place"},
+		{"another name is another collector", iamSpec, map[string]string{"deployment-name": "dbg-other"}, "cannot rename it in place"},
+		{"a newer template refuses", func(t *testing.T) *collector.GcpDeploymentSpec {
+			return deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v9.0")
+		}, nil, "update dbg first"},
+		{"an instaclustr source is not this path's", func(t *testing.T) *collector.GcpDeploymentSpec {
+			cfg, err := collector.Config{
+				Dbgorilla: collector.Dbgorilla{AgentID: "agent-old", TenantID: "tenant-old", Secret: "${DBG_SERVER_SECRET}"},
+				Component: []collector.Component{{Name: "orders", Engine: "postgres",
+					Provider: collector.Provider{Type: "instaclustr", ClusterID: "c-1"},
+					Auth:     collector.Auth{Method: "password", User: "monitor", Password: "${DBG_DB_PASSWORD}"},
+					Connect:  collector.Connect{Host: "h", Port: 5432, SSLMode: "require"}}},
+				Topology: collector.Topology{Interval: "60s"},
+			}.Render()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return deployedGcpSpec(t, cfg, "v1.3")
+		}, nil, "--provider instaclustr"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, deploys := setupGcpUpdate(t, tc.spec(t), completeGcpTarget())
+			for k, v := range tc.flags {
+				mustSet(t, c, k, v)
+			}
+			var err error
+			capture(t, func() { err = runInstallGCP(c) })
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if deploys.count != 0 {
+				t.Error("a refused update deploys nothing")
+			}
+			if st, _ := collector.LoadState(); st == nil || st.AgentID != "agent-old" {
+				t.Errorf("a refused update keeps the record, got %+v", st)
+			}
+		})
+	}
+	t.Run("a vanished deployment is not recreated by an update", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, nil, completeGcpTarget())
+		var err error
+		capture(t, func() { err = runInstallGCP(c) })
+		if err == nil || !strings.Contains(err.Error(), "no longer exists") || deploys.count != 0 {
+			t.Fatalf("err = %v, deploys = %d", err, deploys.count)
+		}
+	})
+}
+
+// A password-auth collector keeps its stored password unless told otherwise;
+// a new password rotates only that secret; --db-password "" moves to IAM.
+func TestRunUpdateGCP_Password(t *testing.T) {
+	stored := installedGcpTarget()
+	stored.AuthMethod, stored.User = "password", "monitor"
+	stored.ServerCaMode = "GOOGLE_MANAGED_INTERNAL_CA"
+	noIAM := completeGcpTarget()
+	noIAM.IamEnabled = false // IAM would be refused: proves it was not consulted
+
+	t.Run("keeps the stored password", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, stored), "v1.4"), noIAM)
+		passwords := stubEnsureGcpDBPassword(t, nil)
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		cfg := decodedConfig(t, deploys.deploy)
+		if !strings.Contains(cfg, `method = "password"`) || !strings.Contains(cfg, `user = "monitor"`) {
+			t.Errorf("stored password auth must survive the update:\n%s", cfg)
+		}
+		if len(*passwords) != 0 {
+			t.Error("no new password, no secret write")
+		}
+		if deploys.deploy.TemplateSource != "gs://dbgorilla-collector-templates/collector/gce/v1.4" || strings.Contains(out, "Moving the deployment") {
+			t.Errorf("a current deployment keeps its template, got %s", deploys.deploy.TemplateSource)
+		}
+	})
+	t.Run("a new password rotates the secret", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, stored), "v1.4"), noIAM)
+		passwords := stubEnsureGcpDBPassword(t, nil)
+		mustSet(t, c, "db-password", "new-pw")
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if len(*passwords) != 1 || (*passwords)[0] != "new-pw" {
+			t.Errorf("the new password should be written once, got %v", *passwords)
+		}
+		if cfg := decodedConfig(t, deploys.deploy); !strings.Contains(cfg, `method = "password"`) || strings.Contains(cfg, "new-pw") {
+			t.Errorf("password auth stays, the value stays out of the config:\n%s", cfg)
+		}
+		if deploys.secretsWritten != 0 {
+			t.Error("the server secret must not be rewritten")
+		}
+	})
+	t.Run("an empty --db-password moves to IAM", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, stored), "v1.4"), completeGcpTarget())
+		mustSet(t, c, "db-password", "")
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if cfg := decodedConfig(t, deploys.deploy); !strings.Contains(cfg, `method = "gcp_iam"`) {
+			t.Errorf("IAM auth should be settled:\n%s", cfg)
+		}
+		if !strings.Contains(out, "gcloud sql users create") {
+			t.Errorf("a changed auth method needs the grant guidance, got:\n%s", out)
+		}
+	})
+}
+
+// A template under development is applied from where it is, as on install.
+func TestRunUpdateGCP_TemplateSourceOverrides(t *testing.T) {
+	c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.3"), completeGcpTarget())
+	mustSet(t, c, "template-source", "gs://dev-bucket/collector/gce/next")
+	var err error
+	out := capture(t, func() { err = runInstallGCP(c) })
+	if err != nil {
+		t.Fatalf("runInstallGCP: %v\n%s", err, out)
+	}
+	if deploys.deploy.TemplateSource != "gs://dev-bucket/collector/gce/next" {
+		t.Errorf("template source = %q", deploys.deploy.TemplateSource)
+	}
+}
+
+func TestRunUpdateGCP_SwitchesTheTarget(t *testing.T) {
+	c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4"), completeGcpTarget())
+	mustSet(t, c, "db-instance-id", "other-pg")
+	var err error
+	out := capture(t, func() { err = runInstallGCP(c) })
+	if err != nil {
+		t.Fatalf("runInstallGCP: %v\n%s", err, out)
+	}
+	cfg := decodedConfig(t, deploys.deploy)
+	if !strings.Contains(cfg, `instance = "other-pg"`) || strings.Contains(cfg, `instance = "prod-pg"`) {
+		t.Errorf("the config should name the new target:\n%s", cfg)
+	}
+	if !strings.HasPrefix(deploys.deploy.Inputs["login_instances"], "other-pg") {
+		t.Errorf("the login condition follows the target, got %q", deploys.deploy.Inputs["login_instances"])
+	}
+	if st, _ := collector.LoadState(); st == nil || st.TargetName != "other-pg" || st.AgentID != "agent-old" {
+		t.Errorf("state = %+v", st)
+	}
+	if !strings.Contains(out, "gcloud sql users create") {
+		t.Errorf("a new target needs the grant guidance, got:\n%s", out)
+	}
+}
+
+func TestRunUpdateGCP_FailuresRollNothingBack(t *testing.T) {
+	cases := []struct {
+		name    string
+		deploy  error
+		wantErr string
+		wantOut string
+	}{
+		{"busy waits", collector.ErrDeployBusy, "Wait for it to finish", ""},
+		{"failure names what may be running", errors.New("apply failed"), "Nothing was rolled back", ""},
+		{"unknown outcome points at status", collector.ErrDeployUnknown, "dbg collector status", ""},
+		{"timeout is not an error", collector.ErrDeployTimeout, "", "Still applying"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4"), completeGcpTarget())
+			stubGcpDeploy(t, tc.deploy)
+			deleted := stubDeleteGcpDeployment(t, nil)
+			var err error
+			out := capture(t, func() { err = runInstallGCP(c) })
+			switch {
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("err = %v, want none\n%s", err, out)
+			}
+			if tc.wantOut != "" && !strings.Contains(out, tc.wantOut) {
+				t.Errorf("want %q in:\n%s", tc.wantOut, out)
+			}
+			if *deleted || deploys.secretsDeleted != 0 {
+				t.Error("an update never tears the deployment or its secrets down")
+			}
+			if st, _ := collector.LoadState(); st == nil || st.AgentID != "agent-old" {
+				t.Errorf("the record must survive, got %+v", st)
+			}
+		})
+	}
+}
+
+// --- upgrade ------------------------------------------------------------------
+
+func TestRunUpgradeGCP(t *testing.T) {
+	const repo = "dbgorillapublic.azurecr.io/dbg-collector"
+	setup := func(t *testing.T, running string) (*cobra.Command, *[]string, *int) {
+		t.Helper()
+		isolate(t)
+		stubGCPOK(t)
+		rolled := stubWaitGcpMigStable(t, nil)
+		saveGcpState(t, running)
+		return gcpCmd(t), stubUpgradeGcpImage(t, nil), rolled
+	}
+	t.Run("rolls the deployment to the pinned image", func(t *testing.T) {
+		c, images, rolled := setup(t, repo+":0.9.0@sha256:old")
+		mustSet(t, c, "image", repo+":0.10.1")
+		var err error
+		out := capture(t, func() { err = runCollectorUpgrade(c, nil) })
+		if err != nil {
+			t.Fatalf("upgrade: %v\n%s", err, out)
+		}
+		if len(*images) != 1 || (*images)[0] != repo+":0.10.1@sha256:testdigest" {
+			t.Errorf("upgrade should carry the digest-pinned image, got %v", *images)
+		}
+		if *rolled != 1 || !strings.Contains(out, "Upgrade applied") {
+			t.Errorf("the rollout should be awaited and reported, got rolled=%d:\n%s", *rolled, out)
+		}
+		if st, _ := collector.LoadState(); st == nil || st.Image != repo+":0.10.1@sha256:testdigest" {
+			t.Errorf("state should record the new image, got %+v", st)
+		}
+	})
+	t.Run("refuses a downgrade unless allowed", func(t *testing.T) {
+		c, images, _ := setup(t, repo+":0.10.1@sha256:old")
+		mustSet(t, c, "image", repo+":0.9.0")
+		var err error
+		capture(t, func() { err = runCollectorUpgrade(c, nil) })
+		if err == nil || !strings.Contains(err.Error(), "refusing to downgrade") || len(*images) != 0 {
+			t.Fatalf("err = %v, upgrades = %v", err, *images)
+		}
+		mustSet(t, c, "allow-downgrade", "true")
+		capture(t, func() { err = runCollectorUpgrade(c, nil) })
+		if err != nil || len(*images) != 1 {
+			t.Fatalf("with --allow-downgrade: err = %v, upgrades = %v", err, *images)
+		}
+	})
+	t.Run("already on the image does nothing", func(t *testing.T) {
+		c, images, _ := setup(t, repo+":0.10.1@sha256:testdigest")
+		mustSet(t, c, "image", repo+":0.10.1")
+		var err error
+		out := capture(t, func() { err = runCollectorUpgrade(c, nil) })
+		if err != nil || len(*images) != 0 || !strings.Contains(out, "nothing to upgrade") {
+			t.Fatalf("err = %v, upgrades = %v:\n%s", err, *images, out)
+		}
+	})
+	t.Run("a busy deployment is reported, not rolled back", func(t *testing.T) {
+		c, _, _ := setup(t, repo+":0.9.0@sha256:old")
+		stubUpgradeGcpImage(t, collector.ErrDeployBusy)
+		mustSet(t, c, "image", repo+":0.10.1")
+		var err error
+		capture(t, func() { err = runCollectorUpgrade(c, nil) })
+		if err == nil || !strings.Contains(err.Error(), "Wait for it to finish") {
 			t.Fatalf("err = %v", err)
+		}
+		if st, _ := collector.LoadState(); st == nil || st.Image != repo+":0.9.0@sha256:old" {
+			t.Errorf("state must keep the running image, got %+v", st)
 		}
 	})
 }

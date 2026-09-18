@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,16 +20,55 @@ const (
 	loggingBase = "https://logging.googleapis.com/v2"
 )
 
-const (
+// Variables rather than constants so tests can shorten the waits.
+var (
 	// computeOpTimeout bounds the whole operation, across several blocking
 	// /wait cycles — it must be a multiple of computeWaitTimeout, or an
 	// operation still RUNNING after the first ~2-minute /wait fails "did not
 	// finish in time" while it is progressing (a MIG recreate regularly does).
+	// It also bounds WaitGcpMigStable, a rollout being the same recreate.
 	computeOpTimeout = 10 * time.Minute
 	// computeWaitTimeout bounds one call to the blocking /wait endpoint, which
 	// itself returns after about two minutes.
 	computeWaitTimeout = 3 * time.Minute
 )
+
+// ErrGcpMigRolling marks a rollout still in progress when the wait budget ran
+// out; the group converges regardless.
+var ErrGcpMigRolling = errors.New("instance group still rolling")
+
+// WaitGcpMigStable waits until the group reports no pending action on its
+// instances — after an update or upgrade, that the instance runs the new
+// template. A stopped group (size 0) is stable at once.
+func WaitGcpMigStable(project, region, deploymentName string) error {
+	ctx := context.Background()
+	cfg, err := loadGCPConfig(ctx)
+	if err != nil {
+		return gcpCredsErr(err)
+	}
+	deadline := time.Now().Add(computeOpTimeout)
+	for {
+		var mig struct {
+			Status struct {
+				IsStable bool `json:"isStable"`
+			} `json:"status"`
+		}
+		if err := gcpDo(ctx, cfg, http.MethodGet, migPath(project, region, deploymentName), nil, &mig); err != nil {
+			return fmt.Errorf("could not read collector group %q: %w", deploymentName, err)
+		}
+		if mig.Status.IsStable {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w after %s", ErrGcpMigRolling, computeOpTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(gcpPollInterval):
+		}
+	}
+}
 
 // migPath is the regional instance group manager the template creates.
 func migPath(project, region, deploymentName string) string {

@@ -67,28 +67,48 @@ func EnsureGcpSecrets(project, deploymentName string, values GcpSecretValues) er
 		return gcpCredsErr(err)
 	}
 	for suffix, value := range values.bySuffix() {
-		id := deploymentName + "-" + suffix
 		if value == "" {
 			value = gcpSecretPlaceholder
 		}
-		createURL := fmt.Sprintf("%s/projects/%s/secrets?secretId=%s",
-			secretManagerBase, url.PathEscape(project), url.QueryEscape(id))
-		create := map[string]any{
-			"replication": map[string]any{"automatic": map[string]any{}},
-			"labels":      map[string]string{"managed-by": "dbgorilla-cli"},
+		if err := ensureGcpSecretVersion(ctx, cfg, project, deploymentName+"-"+suffix, value); err != nil {
+			return err
 		}
-		if err := gcpDo(ctx, cfg, http.MethodPost, createURL, create, nil); err != nil &&
-			!errors.Is(err, errGcpConflict) {
-			return fmt.Errorf("could not create secret %q: %w", id, err)
-		}
-		versionURL := fmt.Sprintf("%s/projects/%s/secrets/%s:addVersion",
-			secretManagerBase, url.PathEscape(project), url.PathEscape(id))
-		payload := map[string]any{
-			"payload": map[string]string{"data": base64.StdEncoding.EncodeToString([]byte(value))},
-		}
-		if err := gcpDo(ctx, cfg, http.MethodPost, versionURL, payload, nil); err != nil {
-			return fmt.Errorf("could not write secret %q: %w", id, err)
-		}
+	}
+	return nil
+}
+
+// EnsureGcpDBPassword writes a new version of the deployment's database
+// password only — an update adding or rotating password auth — leaving the
+// server secret and the Instaclustr key untouched.
+func EnsureGcpDBPassword(project, deploymentName, password string) error {
+	ctx := context.Background()
+	cfg, err := loadGCPConfig(ctx)
+	if err != nil {
+		return gcpCredsErr(err)
+	}
+	return ensureGcpSecretVersion(ctx, cfg, project, deploymentName+"-db-password", password)
+}
+
+// ensureGcpSecretVersion creates the secret if absent and adds value as its
+// newest version.
+func ensureGcpSecretVersion(ctx context.Context, cfg gcpConfig, project, id, value string) error {
+	createURL := fmt.Sprintf("%s/projects/%s/secrets?secretId=%s",
+		secretManagerBase, url.PathEscape(project), url.QueryEscape(id))
+	create := map[string]any{
+		"replication": map[string]any{"automatic": map[string]any{}},
+		"labels":      map[string]string{"managed-by": "dbgorilla-cli"},
+	}
+	if err := gcpDo(ctx, cfg, http.MethodPost, createURL, create, nil); err != nil &&
+		!errors.Is(err, errGcpConflict) {
+		return fmt.Errorf("could not create secret %q: %w", id, err)
+	}
+	versionURL := fmt.Sprintf("%s/projects/%s/secrets/%s:addVersion",
+		secretManagerBase, url.PathEscape(project), url.PathEscape(id))
+	payload := map[string]any{
+		"payload": map[string]string{"data": base64.StdEncoding.EncodeToString([]byte(value))},
+	}
+	if err := gcpDo(ctx, cfg, http.MethodPost, versionURL, payload, nil); err != nil {
+		return fmt.Errorf("could not write secret %q: %w", id, err)
 	}
 	return nil
 }

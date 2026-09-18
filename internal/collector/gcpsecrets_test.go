@@ -143,3 +143,20 @@ func TestDeleteGcpSecrets_ReportsRealFailures(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// An update that adds or rotates password auth rewrites the password only.
+func TestEnsureGcpDBPassword_WritesOnlyThePassword(t *testing.T) {
+	f := newGCPFake(t).
+		on("POST", secCreatePath, 409, `{"error":{"code":409,"message":"already exists","status":"ALREADY_EXISTS"}}`).
+		on("POST", secDBPath+":addVersion", 200, "{}")
+	stubGCP(t, f)
+	if err := EnsureGcpDBPassword("p", "dbg", "new-pw"); err != nil {
+		t.Fatalf("EnsureGcpDBPassword: %v", err)
+	}
+	if f.called("POST", secServerPath+":addVersion") != 0 || f.called("POST", secKeyPath+":addVersion") != 0 {
+		t.Error("only the password may be rewritten")
+	}
+	if !strings.Contains(f.lastBody("POST", secDBPath+":addVersion"), base64.StdEncoding.EncodeToString([]byte("new-pw"))) {
+		t.Error("the new password should be the newest version")
+	}
+}

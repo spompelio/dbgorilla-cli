@@ -111,6 +111,8 @@ func TestGcpTemplateContract_RuntimePins(t *testing.T) {
 		`--name ` + gcpCollectorContainerName,
 		`subnetwork = var.stable_egress ? google_compute_subnetwork.egress[0].id : (var.subnetwork == "" ? null : var.subnetwork)`,
 		"depends_on = [",
+		// stop/start resize the group; an update or upgrade must not undo it.
+		"ignore_changes = [target_size]",
 	} {
 		if !strings.Contains(main, want) {
 			t.Errorf("main.tf must contain %q", want)
@@ -225,5 +227,32 @@ func TestGcpTemplateContract_LoginCondition(t *testing.T) {
 	}
 	if strings.Contains(main, "database_roles") {
 		t.Error("database_roles was replaced by the per-service gates")
+	}
+}
+
+// An update moves a deployment forward to this CLI's template, never back.
+func TestGcpTemplateVersions(t *testing.T) {
+	if v := GcpTemplateSourceVersion("gs://dbgorilla-collector-templates/collector/gce/v1.3/"); v != "v1.3" {
+		t.Errorf("source version = %q", v)
+	}
+	if v := GcpTemplateSourceVersion(HostedGcpTemplateSource()); v != GcpTemplateVersion {
+		t.Errorf("the hosted source must carry the pinned version, got %q", v)
+	}
+	for _, tc := range []struct {
+		a, b string
+		cmp  int
+		ok   bool
+	}{
+		{"v1.3", "v1.4", -1, true},
+		{"v1.10", "v1.9", 1, true},
+		{"v2.0", "v1.9", 1, true},
+		{"v1.4", "v1.4", 0, true},
+		{"dev", "v1.4", 0, false},
+		{"1.4", "v1.4", 0, false},
+	} {
+		cmp, ok := CompareGcpTemplateVersions(tc.a, tc.b)
+		if cmp != tc.cmp || ok != tc.ok {
+			t.Errorf("compare(%s, %s) = %d, %v; want %d, %v", tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
+		}
 	}
 }

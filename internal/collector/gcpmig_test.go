@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -124,5 +125,29 @@ func TestTailGcpLogs_StoppedGroupPointsAtStart(t *testing.T) {
 	}
 	if f.called("POST", logsPath) != 0 {
 		t.Error("no instances means no log query")
+	}
+}
+
+func TestWaitGcpMigStable_PollsUntilStable(t *testing.T) {
+	f := newGCPFake(t).onSeq("GET", migBase,
+		gcpFakeResp{200, `{"status":{"isStable":false}}`},
+		gcpFakeResp{200, `{"status":{"isStable":true}}`})
+	stubGCP(t, f)
+	if err := WaitGcpMigStable("p", "us-central1", "dbg"); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if f.called("GET", migBase) != 2 {
+		t.Errorf("polled %d times, want 2", f.called("GET", migBase))
+	}
+}
+
+func TestWaitGcpMigStable_BudgetRunsOutAsStillRolling(t *testing.T) {
+	orig := computeOpTimeout
+	computeOpTimeout = 0
+	t.Cleanup(func() { computeOpTimeout = orig })
+	stubGCP(t, newGCPFake(t).on("GET", migBase, 200, `{"status":{"isStable":false}}`))
+	err := WaitGcpMigStable("p", "us-central1", "dbg")
+	if !errors.Is(err, ErrGcpMigRolling) {
+		t.Fatalf("err = %v, want ErrGcpMigRolling", err)
 	}
 }

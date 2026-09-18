@@ -82,7 +82,7 @@ func init() {
 	installCmd.Flags().Int("db-port", 5432, "Database port")
 	installCmd.Flags().String("db-name", "", "Comma-separated database names (empty = all databases on the server)")
 	installCmd.Flags().String("db-user", "", "Read-only database user (prompted if omitted)")
-	installCmd.Flags().String("db-password", "", "Database password (prompted without echo if omitted; or set "+collector.DBPasswordEnv+")")
+	installCmd.Flags().String("db-password", "", "Database password (prompted without echo if omitted; or set "+collector.DBPasswordEnv+"). Re-running a gcp install keeps a password-auth collector on its stored password; pass --db-password \"\" to move it to IAM auth")
 	installCmd.Flags().String("ssl-mode", "verify-full", "libpq ssl_mode: disable, require, verify-ca, verify-full (defaults to disable for --target docker, whose database is local and non-TLS by definition)")
 	installCmd.Flags().String("image", collector.DefaultImage, "Collector container image")
 	installCmd.Flags().Bool("yes", false, "Skip confirmation prompts")
@@ -1426,7 +1426,7 @@ func runCollectorUpgrade(cmd *cobra.Command, _ []string) error {
 	image, _ := resolveImage(cmd, nil)
 
 	if st.IsGCP() {
-		return errors.New("upgrade is not supported for the gcp target yet; run `dbg collector uninstall` and re-install with --image")
+		return runUpgradeGCP(cmd, st, image)
 	}
 
 	// Resolve the tag to a digest BEFORE deciding whether to act. The default

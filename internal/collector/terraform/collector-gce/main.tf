@@ -15,6 +15,8 @@
 # v1.4 scopes the IAM grants: each database service's roles only when it hosts
 # the target (cloud_sql_roles / alloydb_roles), and Cloud SQL's IAM database
 # login only to the monitored instances (login_instances, an IAM Condition).
+# It also leaves the group's size alone on re-apply, so `dbg collector
+# install` (update) and `upgrade` keep a stopped collector stopped.
 #
 # Naming contract with the CLI (a change is a version bump): every resource is
 # named by the local part of var.runtime_service_account, which the CLI sets to
@@ -273,6 +275,12 @@ resource "google_compute_region_instance_group_manager" "collector" {
     max_surge_fixed       = 0
     max_unavailable_fixed = 3
     replacement_method    = "RECREATE"
+  }
+
+  # `dbg collector stop` resizes the group to 0 and `start` back to 1. An
+  # update or upgrade re-applies this template and must not undo that.
+  lifecycle {
+    ignore_changes = [target_size]
   }
 
   # The instance reads its secrets at boot; do not start it before it may

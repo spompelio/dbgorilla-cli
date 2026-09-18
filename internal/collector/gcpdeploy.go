@@ -2,10 +2,12 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -38,6 +40,10 @@ type GcpDeploy struct {
 	// Terraform state are readable by config.* read roles.
 	Inputs map[string]string
 	DryRun bool
+	// RequireExisting refuses to create: an update or upgrade of a deployment
+	// that has meanwhile vanished must not quietly become a fresh install
+	// (the secrets and identity it would need are not this run's to mint).
+	RequireExisting bool
 }
 
 // Run deploys (create, or update in place) and waits for a terminal state.
@@ -52,11 +58,101 @@ func gcpDeploymentPath(project, region, name string) string {
 }
 
 type gcpDeployment struct {
-	Name           string `json:"name"`
-	State          string `json:"state"` // CREATING | ACTIVE | UPDATING | DELETING | FAILED | SUSPENDED
-	StateDetail    string `json:"stateDetail"`
-	ErrorLogs      string `json:"errorLogs"`
-	LatestRevision string `json:"latestRevision"`
+	Name               string `json:"name"`
+	State              string `json:"state"` // CREATING | ACTIVE | UPDATING | DELETING | FAILED | SUSPENDED
+	StateDetail        string `json:"stateDetail"`
+	ErrorLogs          string `json:"errorLogs"`
+	LatestRevision     string `json:"latestRevision"`
+	ServiceAccount     string `json:"serviceAccount"`
+	TerraformBlueprint struct {
+		GcsSource   string `json:"gcsSource"`
+		InputValues map[string]struct {
+			InputValue any `json:"inputValue"`
+		} `json:"inputValues"`
+	} `json:"terraformBlueprint"`
+}
+
+// GcpDeploymentSpec is what an existing deployment was applied with: the
+// template it deploys, the account that actuates it, and its input values.
+// An update or upgrade starts from it, so nothing the install chose is
+// re-derived.
+type GcpDeploymentSpec struct {
+	State          string
+	TemplateSource string
+	ServiceAccount string
+	Inputs         map[string]string
+}
+
+func (d *gcpDeployment) spec() *GcpDeploymentSpec {
+	inputs := make(map[string]string, len(d.TerraformBlueprint.InputValues))
+	for k, v := range d.TerraformBlueprint.InputValues {
+		inputs[k] = inputValueString(v.InputValue)
+	}
+	return &GcpDeploymentSpec{
+		State:          d.State,
+		TemplateSource: d.TerraformBlueprint.GcsSource,
+		ServiceAccount: d.ServiceAccount,
+		Inputs:         inputs,
+	}
+}
+
+// inputValueString renders a stored input value the way the CLI sends it: as
+// a string. The CLI only ever sends strings, but a deployment applied by hand
+// may carry typed values.
+func inputValueString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case bool:
+		return strconv.FormatBool(x)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// GetGcpDeploymentSpec reads what the deployment was applied with; nil when
+// it does not exist.
+func GetGcpDeploymentSpec(project, region, name string) (*GcpDeploymentSpec, error) {
+	ctx := context.Background()
+	cfg, err := loadGCPConfig(ctx)
+	if err != nil {
+		return nil, gcpCredsErr(err)
+	}
+	dep, err := getGcpDeployment(ctx, cfg, gcpDeploymentPath(project, region, name))
+	if err != nil || dep == nil {
+		return nil, err
+	}
+	return dep.spec(), nil
+}
+
+// UpgradeGcpImage rolls the deployment to a new collector image, holding
+// every other input and the deployment's own template: the monitored
+// databases and the networking must not change under an upgrade.
+func UpgradeGcpImage(project, region, name, image string) error {
+	spec, err := GetGcpDeploymentSpec(project, region, name)
+	if err != nil {
+		return err
+	}
+	if spec == nil {
+		return fmt.Errorf("deployment %q no longer exists — run `dbg collector install --target gcp` to create one", name)
+	}
+	if spec.Inputs["collector_image"] == image {
+		return fmt.Errorf("already on %s (nothing to upgrade)", image)
+	}
+	inputs := make(map[string]string, len(spec.Inputs))
+	for k, v := range spec.Inputs {
+		inputs[k] = v
+	}
+	inputs["collector_image"] = image
+	return GcpDeploy{
+		Project: project, Region: region, DeploymentName: name,
+		TemplateSource: spec.TemplateSource, ServiceAccount: spec.ServiceAccount,
+		Inputs: inputs, RequireExisting: true,
+	}.Run()
 }
 
 func (d GcpDeploy) body() map[string]any {
@@ -102,6 +198,9 @@ func (d GcpDeploy) deploy(ctx context.Context) error {
 		// Any settled state (ACTIVE, SUSPENDED, FAILED) re-applies in place.
 		return d.mutate(ctx, cfg, http.MethodPatch,
 			infraManagerBase+"/"+path+"?updateMask=service_account,terraform_blueprint")
+	}
+	if d.RequireExisting {
+		return fmt.Errorf("deployment %q no longer exists — run `dbg collector install --target gcp` to create one", d.DeploymentName)
 	}
 	createURL := fmt.Sprintf("%s/projects/%s/locations/%s/deployments?deploymentId=%s",
 		infraManagerBase, url.PathEscape(d.Project), url.PathEscape(d.Region),

@@ -29,6 +29,10 @@ var (
 	runGcpDeploy         = collector.GcpDeploy.Run
 	ensureGcpSecrets     = collector.EnsureGcpSecrets
 	deleteGcpSecrets     = collector.DeleteGcpSecrets
+	readGcpDeployment    = collector.GetGcpDeploymentSpec
+	upgradeGcpImage      = collector.UpgradeGcpImage
+	waitGcpMigStable     = collector.WaitGcpMigStable
+	ensureGcpDBPassword  = collector.EnsureGcpDBPassword
 )
 
 var (
@@ -73,14 +77,6 @@ func runInstallGCP(cmd *cobra.Command) error {
 			return fmt.Errorf("--%s applies to --target aws only", f)
 		}
 	}
-	deployServiceAccount, _ := cmd.Flags().GetString("deploy-service-account")
-	switch {
-	case deployServiceAccount == "" && !dryRun:
-		return errors.New("pass --deploy-service-account: the account Infrastructure Manager actuates Terraform as " +
-			"(it needs roles/config.agent plus permission to create the collector's instance group and service account)")
-	case deployServiceAccount != "" && !gcpServiceAccountRe.MatchString(deployServiceAccount):
-		return fmt.Errorf("--deploy-service-account %q must be of the form projects/<project>/serviceAccounts/<email>", deployServiceAccount)
-	}
 	deploymentName, _ := cmd.Flags().GetString("deployment-name")
 	if !gcpDeploymentNameRe.MatchString(deploymentName) {
 		return fmt.Errorf("--deployment-name %q must be 6-30 chars of [a-z0-9-], starting with a letter and not ending with '-' "+
@@ -90,11 +86,12 @@ func runInstallGCP(cmd *cobra.Command) error {
 	if !collector.ValidGcpProviderType(providerType) {
 		return fmt.Errorf("--provider-type %q is not a Google Cloud provider (expected cloud_sql or alloydb)", providerType)
 	}
-	templateSource, _ := cmd.Flags().GetString("template-source")
-	if templateSource == "" {
-		templateSource = collector.HostedGcpTemplateSource()
-	}
 
+	// An existing gcp collector isn't a conflict — it's an update: re-run with
+	// a different --db-instance-id to change which database it monitors, or
+	// with none to re-discover the same one (a new read replica joins the
+	// login condition), in place (no re-mint, no teardown). Dry runs always
+	// take the fresh path below.
 	prior, status, err := priorCloudInstall(dryRun, (*collector.State).IsGCP,
 		func(st *collector.State) (string, error) {
 			return gcpDeploymentStatus(st.Project, st.Region, st.DeploymentName)
@@ -104,9 +101,20 @@ func runInstallGCP(cmd *cobra.Command) error {
 		return err
 	}
 	if prior != nil {
-		return fmt.Errorf("collector deployment %q already exists (%s). "+
-			"Run `dbg collector uninstall` first; changing an installed gcp collector in place is not supported yet",
-			prior.DeploymentName, status)
+		return runUpdateGCP(cmd, prior, status)
+	}
+
+	deployServiceAccount, _ := cmd.Flags().GetString("deploy-service-account")
+	switch {
+	case deployServiceAccount == "" && !dryRun:
+		return errors.New("pass --deploy-service-account: the account Infrastructure Manager actuates Terraform as " +
+			"(it needs roles/config.agent plus permission to create the collector's instance group and service account)")
+	case deployServiceAccount != "" && !gcpServiceAccountRe.MatchString(deployServiceAccount):
+		return fmt.Errorf("--deploy-service-account %q must be of the form projects/<project>/serviceAccounts/<email>", deployServiceAccount)
+	}
+	templateSource, _ := cmd.Flags().GetString("template-source")
+	if templateSource == "" {
+		templateSource = collector.HostedGcpTemplateSource()
 	}
 
 	if err := printCloudIdentity("Google Cloud", gcpAvailable, gcpIdentity); err != nil {
@@ -325,7 +333,13 @@ func resolveGcpTarget(cmd *cobra.Command, project string) (collector.GcpTarget, 
 		seed.Databases = splitCSV(names)
 	}
 	seed.User, _ = cmd.Flags().GetString("db-user")
+	return resolveGcpTargetFrom(cmd, id, providerType, seed)
+}
 
+// resolveGcpTargetFrom is resolveGcpTarget with the id, provider hint and
+// seed supplied — the update path defaults them from what the collector
+// monitors now.
+func resolveGcpTargetFrom(cmd *cobra.Command, id, providerType string, seed collector.GcpTarget) (collector.GcpTarget, error) {
 	target, err := discoverGcpTarget(id, providerType, seed)
 	var amb *collector.AmbiguousTargetError
 	if errors.As(err, &amb) && interactiveSelectable(cmd) {
@@ -435,4 +449,293 @@ func gcpStatus(cmd *cobra.Command, st *collector.State) error {
 	return cloudStatus(cmd, st, "Deployment", st.DeploymentName, func() (string, error) {
 		return gcpDeploymentStatus(st.Project, st.Region, st.DeploymentName)
 	})
+}
+
+// --- update and upgrade ------------------------------------------------------
+
+// runUpdateGCP updates an installed gcp collector in place: the database it
+// monitors (a re-run with --db-instance-id, or the same one re-discovered so
+// a new read replica joins the login condition), its auth, and its
+// query-analysis commands. Identity, endpoints, image and networking come
+// from the deployment itself — nothing is re-minted, nothing torn down.
+func runUpdateGCP(cmd *cobra.Command, st *collector.State, status string) error {
+	// Where the collector runs cannot change in place.
+	for _, f := range []string{"network", "subnetwork", "deploy-service-account"} {
+		if cmd.Flags().Changed(f) {
+			return fmt.Errorf("--%s cannot change an installed collector in place; "+
+				"run `dbg collector uninstall` and re-install to move it", f)
+		}
+	}
+	if p, _ := cmd.Flags().GetString("project"); p != "" && p != st.Project {
+		return fmt.Errorf("collector %s runs in project %s; --project %s cannot move it in place "+
+			"(run `dbg collector uninstall` and re-install)", st.AgentID, st.Project, p)
+	}
+	if n, _ := cmd.Flags().GetString("deployment-name"); cmd.Flags().Changed("deployment-name") && n != st.DeploymentName {
+		return fmt.Errorf("collector %s is deployment %q; --deployment-name %q cannot rename it in place "+
+			"(run `dbg collector uninstall` and re-install)", st.AgentID, st.DeploymentName, n)
+	}
+	if err := printCloudIdentity("Google Cloud", gcpAvailable, gcpIdentity); err != nil {
+		return err
+	}
+
+	spec, err := readGcpDeployment(st.Project, st.Region, st.DeploymentName)
+	if err != nil {
+		return err
+	}
+	if spec == nil {
+		return fmt.Errorf("deployment %q no longer exists — re-run to install fresh", st.DeploymentName)
+	}
+	stored, comp, err := gcpStoredComponent(spec, st.DeploymentName)
+	if err != nil {
+		return err
+	}
+	templateSource, err := gcpUpdateTemplateSource(spec.TemplateSource)
+	if err != nil {
+		return err
+	}
+	// As on install, --template-source names the directory to apply — for a
+	// template under development, before it is published.
+	if v, _ := cmd.Flags().GetString("template-source"); v != "" {
+		templateSource = v
+	}
+
+	// Which database: the flag, else the one the collector monitors now.
+	storedID, storedType := gcpStoredTargetID(comp)
+	id, providerType := storedID, storedType
+	if v, _ := cmd.Flags().GetString("db-instance-id"); v != "" {
+		id = v
+	}
+	if v, _ := cmd.Flags().GetString("provider-type"); v != "" {
+		providerType = v
+	}
+	sameTarget := id == storedID && providerType == storedType
+	seed := collector.GcpTarget{Project: st.Project}
+	if names, _ := cmd.Flags().GetString("db-name"); names != "" {
+		seed.Databases = splitCSV(names)
+	} else if sameTarget {
+		seed.Databases = comp.Connect.Databases
+	}
+	seed.User, _ = cmd.Flags().GetString("db-user")
+	target, err := resolveGcpTargetFrom(cmd, id, providerType, seed)
+	if err != nil {
+		return err
+	}
+	fmt.Println(style.Success(fmt.Sprintf("✓ Target database: %s (%s)", target.InstanceID, target.Host)))
+
+	// Auth: a password given now wins; a password-auth collector keeps the
+	// password already in Secret Manager unless --db-password "" asks for
+	// the move to IAM; otherwise IAM, settled as on install.
+	dbPassword := dbPasswordFlag(cmd)
+	wantIAM := cmd.Flags().Changed("db-password") && dbPassword == ""
+	if dbPassword == "" && !wantIAM && sameTarget && comp.Auth.Method == "password" {
+		target.AuthMethod = "password"
+		if target.User == "" {
+			target.User = comp.Auth.User
+		}
+	} else if err := resolveGcpAuth(&target, dbPassword, st.DeploymentName, st.Project); err != nil {
+		return err
+	}
+	targets := []collector.GcpTarget{target}
+
+	// Query-analysis commands: the flags when given; otherwise what the
+	// collector runs with now (a new target settles them as an install does).
+	commandsEnabled := stored.Commands.Enabled
+	if cmd.Flags().Changed("commands") || cmd.Flags().Changed("enable-commands") || !sameTarget {
+		commandsEnabled = resolveCommands(cmd, targets, gcpTargetLabel)
+	} else {
+		targets[0].Commands = comp.Commands
+	}
+	allowProjectWideLogin, _ := cmd.Flags().GetBool("allow-project-wide-login")
+	printGcpLoginScope(targets, allowProjectWideLogin, st.Project)
+
+	inputs, err := collector.GcpDeployInputs(collector.GcpStackInput{
+		AgentID:               stored.Dbgorilla.AgentID,
+		TenantID:              stored.Dbgorilla.TenantID,
+		Image:                 spec.Inputs["collector_image"],
+		Endpoints:             gcpStoredEndpoints(stored, cmd),
+		Targets:               targets,
+		Network:               spec.Inputs["network"],
+		Subnetwork:            spec.Inputs["subnetwork"],
+		Region:                st.Region,
+		DeploymentName:        st.DeploymentName,
+		Project:               st.Project,
+		CommandsEnabled:       commandsEnabled,
+		StableEgress:          spec.Inputs["stable_egress"] == "true",
+		NatSubnetCidr:         spec.Inputs["nat_subnet_cidr"],
+		AllowProjectWideLogin: allowProjectWideLogin,
+	})
+	if err != nil {
+		return err
+	}
+
+	if dbPassword != "" {
+		if err := ensureGcpDBPassword(st.Project, st.DeploymentName, dbPassword); err != nil {
+			return err
+		}
+		fmt.Println(style.Success("✓ Database password written to Secret Manager"))
+	}
+	st.TargetName = target.DisplayName()
+	saveStateOrWarn(st)
+
+	fmt.Printf("Updating collector %s in place (deployment %q, %s)...\n", st.AgentID, st.DeploymentName, status)
+	deploy := collector.GcpDeploy{
+		Project: st.Project, Region: st.Region, DeploymentName: st.DeploymentName,
+		TemplateSource: templateSource, ServiceAccount: spec.ServiceAccount,
+		Inputs: inputs, RequireExisting: true,
+	}
+	if err := withSpinner("Updating the deployment…", func() error { return runGcpDeploy(deploy) }); err != nil {
+		return gcpUpdateFailed(err, st.DeploymentName)
+	}
+	fmt.Println(style.Success(fmt.Sprintf("✓ Collector updated (deployment %s).", st.DeploymentName)))
+	awaitGcpRollout(st)
+	if !sameTarget || target.AuthMethod != comp.Auth.Method {
+		printGcpGrantGuidance(target, st.DeploymentName, st.Project)
+	}
+	fmt.Println("\nConfirm it connected with: dbg collector status")
+	return nil
+}
+
+// runUpgradeGCP rolls the deployment to a new collector image, holding
+// everything else — the deployment's own template and inputs.
+func runUpgradeGCP(cmd *cobra.Command, st *collector.State, image string) error {
+	// Over HTTP, as on aws: no container runtime to pull with, and an
+	// unresolved tag leaves the deployment with an unchanged input and
+	// therefore nothing to roll.
+	pinned, err := pinImageRemote(image)
+	if err != nil {
+		return fmt.Errorf("cannot resolve %s to a fixed version: %w", image, err)
+	}
+	if done, err := checkUpgradeDirection(cmd, st.Image, pinned); done || err != nil {
+		return err
+	}
+	fmt.Printf("Upgrading to %s...\n", pinned)
+	if err := withSpinner("Updating the deployment…", func() error {
+		return upgradeGcpImage(st.Project, st.Region, st.DeploymentName, pinned)
+	}); err != nil {
+		return gcpUpdateFailed(err, st.DeploymentName)
+	}
+	st.Image = pinned
+	if err := collector.SaveState(st); err != nil {
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  upgraded, but could not update stored state: %v", err)))
+	}
+	fmt.Println(style.Success(fmt.Sprintf("✓ Upgrade applied (deployment %s).", st.DeploymentName)))
+	awaitGcpRollout(st)
+	return nil
+}
+
+// gcpStoredComponent reads the deployment's collector config back — strictly,
+// so a key this CLI cannot model is refused rather than silently dropped from
+// a running collector — and returns the one Google-hosted database it
+// monitors. A deployment monitoring something else (the instaclustr source)
+// is not this path's to modify.
+func gcpStoredComponent(spec *collector.GcpDeploymentSpec, deploymentName string) (collector.Config, collector.Component, error) {
+	decoded, err := collector.DecodeConfig(spec.Inputs["collector_config"])
+	if err != nil {
+		return collector.Config{}, collector.Component{},
+			fmt.Errorf("could not read the collector config stored on deployment %q: %w", deploymentName, err)
+	}
+	conf, err := collector.StrictParseConfig(decoded)
+	if err != nil {
+		return collector.Config{}, collector.Component{},
+			fmt.Errorf("could not read the collector config stored on deployment %q: %w", deploymentName, err)
+	}
+	if len(conf.Component) != 1 {
+		return collector.Config{}, collector.Component{},
+			fmt.Errorf("deployment %q monitors %d databases; this update path handles exactly one — "+
+				"run `dbg collector uninstall` and re-install", deploymentName, len(conf.Component))
+	}
+	comp := conf.Component[0]
+	if comp.Provider.Type != "cloud_sql" && comp.Provider.Type != "alloydb" {
+		return collector.Config{}, collector.Component{},
+			fmt.Errorf("deployment %q monitors a %s source, which this update path cannot modify. "+
+				"Run `dbg collector uninstall` and re-run the matching `dbg collector install --provider %s --target gcp` instead",
+				deploymentName, comp.Provider.Type, comp.Provider.Type)
+	}
+	return conf, comp, nil
+}
+
+// gcpStoredTargetID is the --db-instance-id and --provider-type that name
+// what the deployment monitors now.
+func gcpStoredTargetID(comp collector.Component) (id, providerType string) {
+	if comp.Provider.Type == "alloydb" {
+		return comp.Provider.Cluster + "/" + comp.Provider.Instance, "alloydb"
+	}
+	return comp.Provider.Instance, "cloud_sql"
+}
+
+// gcpStoredEndpoints are the deployment's own control-plane endpoints, with
+// any explicit --*-url flag overriding — the same precedence an install has.
+func gcpStoredEndpoints(conf collector.Config, cmd *cobra.Command) collector.Endpoints {
+	e := collector.Endpoints{
+		AuthBaseURL:  conf.Dbgorilla.AuthBaseURL,
+		OtlpBaseURL:  conf.Dbgorilla.OtlpBaseURL,
+		OpampBaseURL: conf.Dbgorilla.OpampBaseURL,
+	}
+	if v := authURLFlag(cmd); v != "" {
+		e.AuthBaseURL = v
+	}
+	if v, _ := cmd.Flags().GetString("otlp-url"); v != "" {
+		e.OtlpBaseURL = withDefaultPort(v)
+	}
+	if v, _ := cmd.Flags().GetString("opamp-url"); v != "" {
+		e.OpampBaseURL = v
+	}
+	return e
+}
+
+// gcpUpdateTemplateSource decides which template an update applies. The
+// deployment's own, normally; this CLI's newer published version when the
+// deployment is behind (the inputs are re-rendered in full, so the newer
+// contract is met); never an older one — a deployment ahead of this dbg would
+// lose whatever the newer template added, so that refuses. A custom source
+// (not the published layout) is kept as it is. --template-source overrides
+// the result.
+func gcpUpdateTemplateSource(deployed string) (string, error) {
+	v := collector.GcpTemplateSourceVersion(deployed)
+	cmp, ok := collector.CompareGcpTemplateVersions(v, collector.GcpTemplateVersion)
+	switch {
+	case !ok:
+		return deployed, nil
+	case cmp > 0:
+		return "", fmt.Errorf("the deployment runs template %s, newer than the %s this dbg deploys — "+
+			"update dbg first: dbg upgrade", v, collector.GcpTemplateVersion)
+	case cmp < 0:
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  Moving the deployment from template %s to %s", v, collector.GcpTemplateVersion)))
+		return collector.HostedGcpTemplateSource(), nil
+	}
+	return deployed, nil
+}
+
+// gcpUpdateFailed reports a failed in-place update or upgrade. Nothing is
+// rolled back on any path: the deployment's previous revision is
+// Infrastructure Manager's to keep, and the identity and local record stay
+// valid.
+func gcpUpdateFailed(err error, deploymentName string) error {
+	switch {
+	case errors.Is(err, collector.ErrDeployBusy):
+		return fmt.Errorf("%w\n\nWait for it to finish, then re-run", err)
+	case errors.Is(err, collector.ErrDeployTimeout):
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  Still applying after %s — deployment %s is most likely still converging.",
+			collector.GcpDeployTimeout(), deploymentName)))
+		fmt.Println("   Watch it with: dbg collector status")
+		return nil
+	case errors.Is(err, errInterrupted), errors.Is(err, collector.ErrDeployUnknown):
+		return fmt.Errorf("%w\n\nNothing was rolled back. Run `dbg collector status` to see whether deployment %s converged; "+
+			"if it failed, fix the issue and re-run", err, deploymentName)
+	}
+	return fmt.Errorf("%w\n\nNothing was rolled back: the collector may be running its previous configuration, or a partial one. "+
+		"Fix the issue above and re-run; `dbg collector status` shows deployment %s's state", err, deploymentName)
+}
+
+// awaitGcpRollout waits for the instance group to settle on the new template.
+// A slow rollout is reported, not fatal: the group converges on its own.
+func awaitGcpRollout(st *collector.State) {
+	err := withSpinner("Rolling the collector instance…", func() error {
+		return waitGcpMigStable(st.Project, st.Region, st.DeploymentName)
+	})
+	if err != nil {
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  %v — check `dbg collector status`", err)))
+		return
+	}
+	fmt.Println(style.Success("✓ Collector instance rolled to the new configuration"))
 }

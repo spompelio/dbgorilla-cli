@@ -16,7 +16,8 @@
 # the target (cloud_sql_roles / alloydb_roles), and Cloud SQL's IAM database
 # login only to the monitored instances (login_instances, an IAM Condition).
 # It also leaves the group's size alone on re-apply, so `dbg collector
-# install` (update) and `upgrade` keep a stopped collector stopped.
+# install` (update) and `upgrade` keep a stopped collector stopped, and pulls
+# an Artifact Registry image as the VM's own service account.
 #
 # Naming contract with the CLI (a change is a version bump): every resource is
 # named by the local part of var.runtime_service_account, which the CLI sets to
@@ -201,18 +202,30 @@ locals {
         "https://secretmanager.googleapis.com/v1/projects/${local.project}/secrets/$1/versions/latest:access" \
         | python3 -c 'import json,sys,base64; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode())'
     }
+    IMAGE="${var.collector_image}"
     DBG_SERVER_SECRET=$(retry 30 secret "${local.name}-server-secret")
     DBG_DB_PASSWORD=$(retry 30 secret "${local.name}-db-password")
     INSTACLUSTR_API_KEY=$(retry 30 secret "${local.name}-instaclustr-api-key")
     export DBG_SERVER_SECRET DBG_DB_PASSWORD INSTACLUSTR_API_KEY
     mkdir -p /var/lib/dbgorilla
     retry 30 metadata instance/attributes/collector-config | base64 -d > /var/lib/dbgorilla/collector.toml
+    # An image in Artifact Registry or Container Registry pulls as the VM's
+    # own service account (which needs roles/artifactregistry.reader on the
+    # repository); any other registry is pulled anonymously. Docker's config
+    # goes under /var/lib: /root is read-only on Container-Optimized OS.
+    export HOME=/var/lib/dbgorilla DOCKER_CONFIG=/var/lib/dbgorilla/.docker
+    mkdir -p "$DOCKER_CONFIG"
+    registry="$${IMAGE%%/*}"
+    case "$registry" in
+      *-docker.pkg.dev|docker.pkg.dev|gcr.io|*.gcr.io)
+        docker-credential-gcr configure-docker --registries="$registry" ;;
+    esac
     docker run -d --name dbg-collector --restart=always --network=host \
       -v /var/lib/dbgorilla/collector.toml:/etc/dbgorilla/collector.toml:ro \
       -e DBG_SERVER_SECRET \
       -e DBG_DB_PASSWORD \
       -e INSTACLUSTR_API_KEY \
-      "${var.collector_image}" --config-file /etc/dbgorilla/collector.toml
+      "$IMAGE" --config-file /etc/dbgorilla/collector.toml
   EOT
 }
 

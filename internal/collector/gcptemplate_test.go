@@ -113,6 +113,11 @@ func TestGcpTemplateContract_RuntimePins(t *testing.T) {
 		"depends_on = [",
 		// stop/start resize the group; an update or upgrade must not undo it.
 		"ignore_changes = [target_size]",
+		// A private Artifact Registry image pulls as the VM's own identity,
+		// with Docker's config somewhere COS lets root write.
+		`export HOME=/var/lib/dbgorilla DOCKER_CONFIG=/var/lib/dbgorilla/.docker`,
+		`docker-credential-gcr configure-docker --registries="$registry"`,
+		`"$IMAGE" --config-file /etc/dbgorilla/collector.toml`,
 	} {
 		if !strings.Contains(main, want) {
 			t.Errorf("main.tf must contain %q", want)

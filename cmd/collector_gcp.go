@@ -545,7 +545,15 @@ func runUpdateGCP(cmd *cobra.Command, st *collector.State, status string) error 
 	} else {
 		targets[0].Commands = comp.Commands
 	}
+	// The login scope: the flag when given; otherwise what the deployment
+	// chose. A deployment from before login_instances existed gets the
+	// condition — that is the point of moving it forward.
 	allowProjectWideLogin, _ := cmd.Flags().GetBool("allow-project-wide-login")
+	if !cmd.Flags().Changed("allow-project-wide-login") {
+		if v, declared := spec.Inputs["login_instances"]; declared && v == "" && comp.Provider.Type == "cloud_sql" {
+			allowProjectWideLogin = true
+		}
+	}
 	printGcpLoginScope(targets, allowProjectWideLogin, st.Project)
 
 	inputs, err := collector.GcpDeployInputs(collector.GcpStackInput{

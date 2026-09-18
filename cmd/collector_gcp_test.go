@@ -1447,6 +1447,42 @@ func TestRunUpdateGCP_TemplateSourceOverrides(t *testing.T) {
 	}
 }
 
+// A deployment that opted out of the login condition keeps that choice on an
+// update unless the flag says otherwise; one from before the condition
+// existed gets it.
+func TestRunUpdateGCP_LoginScopeCarriesOver(t *testing.T) {
+	optedOut := func(t *testing.T) *collector.GcpDeploymentSpec {
+		spec := deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4")
+		delete(spec.Inputs, "database_roles")
+		spec.Inputs["cloud_sql_roles"], spec.Inputs["alloydb_roles"], spec.Inputs["login_instances"] = "true", "false", ""
+		return spec
+	}
+	t.Run("an opt-out stays opted out", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, optedOut(t), completeGcpTarget())
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if deploys.deploy.Inputs["login_instances"] != "" || !strings.Contains(out, "--allow-project-wide-login") {
+			t.Errorf("login_instances = %q; the stored opt-out must carry over and be warned about:\n%s",
+				deploys.deploy.Inputs["login_instances"], out)
+		}
+	})
+	t.Run("the flag re-scopes it", func(t *testing.T) {
+		c, deploys := setupGcpUpdate(t, optedOut(t), completeGcpTarget())
+		mustSet(t, c, "allow-project-wide-login", "false")
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if deploys.deploy.Inputs["login_instances"] != "prod-pg,prod-pg-replica" {
+			t.Errorf("login_instances = %q, want the condition back", deploys.deploy.Inputs["login_instances"])
+		}
+	})
+}
+
 func TestRunUpdateGCP_SwitchesTheTarget(t *testing.T) {
 	c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4"), completeGcpTarget())
 	mustSet(t, c, "db-instance-id", "other-pg")

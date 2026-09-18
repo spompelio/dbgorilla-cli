@@ -213,6 +213,7 @@ func (d GcpDeploy) mutate(ctx context.Context, cfg gcpConfig, method, rawURL str
 	if err != nil {
 		return fmt.Errorf("could not deploy %q: %w", d.DeploymentName, err)
 	}
+	path := gcpDeploymentPath(d.Project, d.Region, d.DeploymentName)
 	if err := waitGcpOperation(ctx, cfg, op, gcpDeployTimeout); err != nil {
 		switch {
 		case errors.Is(err, ErrDeployTimeout):
@@ -221,9 +222,23 @@ func (d GcpDeploy) mutate(ctx context.Context, cfg gcpConfig, method, rawURL str
 		case errors.Is(err, ErrDeployUnknown):
 			return fmt.Errorf("deployment %q may still be applying: %w", d.DeploymentName, err)
 		}
-		path := gcpDeploymentPath(d.Project, d.Region, d.DeploymentName)
 		return fmt.Errorf("deployment %q did not apply cleanly: %w%s",
 			d.DeploymentName, err, gcpDeploymentFailureReason(ctx, cfg, path))
+	}
+	// The operation finishing is not the apply succeeding: an update whose
+	// revision fails at terraform apply completes its operation without an
+	// error payload (observed live) and leaves the deployment FAILED. Read
+	// the deployment back rather than trust the operation.
+	dep, err := getGcpDeployment(ctx, cfg, path)
+	if err != nil {
+		return fmt.Errorf("deployment %q applied, but its state could not be read back: %w", d.DeploymentName, err)
+	}
+	if dep == nil {
+		return fmt.Errorf("deployment %q is gone after the apply", d.DeploymentName)
+	}
+	if dep.State == "FAILED" {
+		return fmt.Errorf("deployment %q did not apply cleanly (%s)%s",
+			d.DeploymentName, dep.State, gcpDeploymentFailureReason(ctx, cfg, path))
 	}
 	return nil
 }
@@ -318,20 +333,21 @@ func DeleteGcpDeployment(project, region, name string) error {
 	return nil
 }
 
-// gcpDeploymentFailureReason best-effort appends the deployment's error detail.
+// gcpDeploymentFailureReason best-effort appends the deployment's error
+// detail, and where Infrastructure Manager put the apply log.
 func gcpDeploymentFailureReason(ctx context.Context, cfg gcpConfig, path string) string {
 	dep, err := getGcpDeployment(ctx, cfg, path)
 	if err != nil || dep == nil {
 		return ""
 	}
-	detail := dep.StateDetail
-	if detail == "" && dep.ErrorLogs != "" {
-		detail = "error logs: " + dep.ErrorLogs
+	out := ""
+	if dep.StateDetail != "" {
+		out += "\n  reason: " + dep.StateDetail
 	}
-	if detail == "" {
-		return ""
+	if dep.ErrorLogs != "" {
+		out += "\n  apply log: " + dep.ErrorLogs
 	}
-	return "\n  reason: " + detail
+	return out
 }
 
 // getGcpDeployment fetches a deployment; a 404 is (nil, nil).

@@ -29,7 +29,10 @@ func testDeploy() GcpDeploy {
 func TestGcpDeploy_CreatesWhenAbsent(t *testing.T) {
 	f := newGCPFake(t).
 		on("GET", probePath, 200, "# template").
-		on("GET", depPath, 404, gcpNotFoundJSON).
+		// Absent before the create; ACTIVE when read back after the operation.
+		onSeq("GET", depPath,
+			gcpFakeResp{404, gcpNotFoundJSON},
+			gcpFakeResp{200, deploymentJSON("ACTIVE", "")}).
 		on("POST", depsPath, 200, operationJSON(opResource, false, "")).
 		onSeq("GET", opPath,
 			gcpFakeResp{200, operationJSON(opResource, false, "")},
@@ -64,7 +67,10 @@ func TestGcpDeploy_SettledDeploymentsUpdateInPlace(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			f := newGCPFake(t).
 				on("GET", probePath, 200, "# template").
-				on("GET", depPath, 200, deploymentJSON(state, "")).
+				// The settled state before; ACTIVE once the re-apply lands.
+				onSeq("GET", depPath,
+					gcpFakeResp{200, deploymentJSON(state, "")},
+					gcpFakeResp{200, deploymentJSON("ACTIVE", "")}).
 				on("PATCH", depPath, 200, operationJSON(opResource, true, ""))
 			stubGCP(t, f)
 			if err := testDeploy().Run(); err != nil {
@@ -77,6 +83,27 @@ func TestGcpDeploy_SettledDeploymentsUpdateInPlace(t *testing.T) {
 				t.Errorf("the update must mask to the fields it sends, got %s", c)
 			}
 		})
+	}
+}
+
+// An update whose revision fails at terraform apply completes its operation
+// with no error payload; the deployment's own state says FAILED.
+func TestGcpDeploy_FailedRevisionBehindACleanOperation(t *testing.T) {
+	f := newGCPFake(t).
+		on("GET", probePath, 200, "# template").
+		onSeq("GET", depPath,
+			gcpFakeResp{200, deploymentJSON("ACTIVE", "")},
+			gcpFakeResp{200, `{"name":"projects/p/locations/us-central1/deployments/dbg","state":"FAILED",` +
+				`"stateDetail":"Revision failed: the apply build failed while running: tf-apply.","errorLogs":"gs://logs/dbg/r-2/errors/tf-error.ndjson"}`}).
+		on("PATCH", depPath, 200, operationJSON(opResource, true, ""))
+	stubGCP(t, f)
+	err := testDeploy().Run()
+	if err == nil || !strings.Contains(err.Error(), "did not apply cleanly") ||
+		!strings.Contains(err.Error(), "tf-apply") || !strings.Contains(err.Error(), "gs://logs/dbg/r-2") {
+		t.Fatalf("err = %v, want the failed state with its reason and log", err)
+	}
+	if errors.Is(err, ErrDeployTimeout) || errors.Is(err, ErrDeployUnknown) || errors.Is(err, ErrDeployBusy) {
+		t.Fatalf("a failed apply is a plain failure, got %v", err)
 	}
 }
 

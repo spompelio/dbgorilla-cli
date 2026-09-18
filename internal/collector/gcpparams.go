@@ -20,9 +20,11 @@ const gceMetadataConfigLimit = 245760
 // grants the collector's service account read access — so the map is
 // printable, and nothing secret ever reaches Infrastructure Manager.
 var gcpInputKeys = []string{
+	"alloydb_roles",
+	"cloud_sql_roles",
 	"collector_config",
 	"collector_image",
-	"database_roles",
+	"login_instances",
 	"nat_subnet_cidr",
 	"network",
 	"region",
@@ -75,6 +77,32 @@ type GcpStackInput struct {
 	// range; Subnetwork is ignored when set, the template picks its own.
 	StableEgress  bool
 	NatSubnetCidr string
+	// AllowProjectWideLogin drops the IAM Condition that scopes the
+	// collector's Cloud SQL IAM login to the monitored instances — the
+	// --allow-project-wide-login opt-out.
+	AllowProjectWideLogin bool
+}
+
+// GcpLoginInstances lists the Cloud SQL instances the collector logs in to —
+// each cloud_sql target and its read replicas — which is what the template's
+// IAM Condition on roles/cloudsql.instanceUser names. AlloyDB targets
+// contribute nothing: AlloyDB's login check matches no resource name, so that
+// grant cannot be scoped.
+func GcpLoginInstances(targets []GcpTarget) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range targets {
+		if t.ProviderType != "cloud_sql" {
+			continue
+		}
+		for _, id := range append([]string{t.InstanceID}, t.Replicas...) {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // GcpDeployInputs renders the template's input variables. The map is
@@ -100,17 +128,28 @@ func GcpDeployInputs(in GcpStackInput) (inputs map[string]string, err error) {
 	if in.StableEgress {
 		stableEgress = "true"
 	}
-	// The Cloud SQL / AlloyDB project-wide roles only make sense when the
-	// target IS a Google-managed database; pre-rendered components (the
-	// instaclustr source) monitor something else entirely.
-	databaseRoles := "true"
-	if len(in.Components) > 0 {
-		databaseRoles = "false"
+	// Each database service's project-wide roles only when it hosts a
+	// target; pre-rendered components (the instaclustr source) monitor
+	// something else entirely and get neither set.
+	cloudSQLRoles, alloyDBRoles := "false", "false"
+	for _, t := range in.Targets {
+		switch t.ProviderType {
+		case "cloud_sql":
+			cloudSQLRoles = "true"
+		case "alloydb":
+			alloyDBRoles = "true"
+		}
+	}
+	loginInstances := ""
+	if !in.AllowProjectWideLogin {
+		loginInstances = strings.Join(GcpLoginInstances(in.Targets), ",")
 	}
 	inputs = map[string]string{
+		"alloydb_roles":           alloyDBRoles,
+		"cloud_sql_roles":         cloudSQLRoles,
 		"collector_config":        encoded,
 		"collector_image":         in.Image,
-		"database_roles":          databaseRoles,
+		"login_instances":         loginInstances,
 		"nat_subnet_cidr":         in.NatSubnetCidr,
 		"network":                 in.Network,
 		"region":                  in.Region,

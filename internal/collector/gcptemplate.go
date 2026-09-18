@@ -18,8 +18,10 @@ const (
 
 // GcpTemplateVersion is the template's own version, bumped when its input
 // contract changes; a published version is never rewritten. v1.3 removed the
-// secret inputs: the CLI writes them to Secret Manager itself.
-const GcpTemplateVersion = "v1.3"
+// secret inputs (the CLI writes them to Secret Manager itself); v1.4 scopes
+// the IAM grants per database service and conditions Cloud SQL's login role
+// on the monitored instances.
+const GcpTemplateVersion = "v1.4"
 
 const gcpTemplateProbeTimeout = 5 * time.Second
 

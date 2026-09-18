@@ -2,7 +2,7 @@
 # instance group running the collector container on Container-Optimized OS,
 # deployed by Infrastructure Manager (or plain Terraform).
 #
-# template-version: v1.3
+# template-version: v1.4
 #
 # This file is published, never embedded in the CLI. Secret values never reach
 # it: the CLI writes them to Secret Manager before deploying (v1.2 passed them
@@ -11,6 +11,10 @@
 # template only grants the instance's service account read access by name;
 # the instance fetches the values at boot, so they never appear in instance
 # metadata either.
+#
+# v1.4 scopes the IAM grants: each database service's roles only when it hosts
+# the target (cloud_sql_roles / alloydb_roles), and Cloud SQL's IAM database
+# login only to the monitored instances (login_instances, an IAM Condition).
 #
 # Naming contract with the CLI (a change is a version bump): every resource is
 # named by the local part of var.runtime_service_account, which the CLI sets to
@@ -47,21 +51,39 @@ resource "google_service_account" "collector" {
   display_name = "DBGorilla collector"
 }
 
-# Read-only monitoring plus log writing for `dbg collector logs` always; the
-# connect and IAM-login roles of both database services only when a
-# Google-managed database is the target — they are project-wide grants
-# (instanceUser permits IAM database login to ANY Cloud SQL instance in the
-# project), so a source that is not a Google database must not carry them.
+# Read-only monitoring plus log writing for `dbg collector logs` always. The
+# viewer, connect and IAM-login roles of a database service only when that
+# service hosts the target: they are project-wide grants, so a source that is
+# not a Google database (the instaclustr source) carries neither set, and a
+# Cloud SQL target does not carry AlloyDB's.
+#
+# IAM database login is scoped one step further. On Cloud SQL,
+# roles/cloudsql.instanceUser carries an IAM Condition naming the monitored
+# instance and its read replicas (var.login_instances), so the collector's
+# service account can log in nowhere else in the project. AlloyDB's login
+# check exposes no resource name an IAM Condition can match, so
+# roles/alloydb.databaseUser stays project-wide; the CLI says so when it
+# deploys one. Either way the account only logs in where it has been
+# registered as a database user.
+locals {
+  login_instances = compact(split(",", var.login_instances))
+  login_condition = join(" || ", [
+    for i in local.login_instances : "resource.name == \"projects/${local.project}/instances/${i}\""
+  ])
+}
+
 resource "google_project_iam_member" "collector" {
   for_each = toset(concat(
     [
       "roles/monitoring.viewer",
       "roles/logging.logWriter",
     ],
-    var.database_roles ? [
+    var.cloud_sql_roles ? [
       "roles/cloudsql.viewer",
       "roles/cloudsql.client",
       "roles/cloudsql.instanceUser",
+    ] : [],
+    var.alloydb_roles ? [
       "roles/alloydb.viewer",
       "roles/alloydb.client",
       "roles/alloydb.databaseUser",
@@ -70,6 +92,15 @@ resource "google_project_iam_member" "collector" {
   project = local.project
   role    = each.value
   member  = "serviceAccount:${google_service_account.collector.email}"
+
+  dynamic "condition" {
+    for_each = each.value == "roles/cloudsql.instanceUser" && length(local.login_instances) > 0 ? [1] : []
+    content {
+      title       = "${local.name}-login"
+      description = "DBGorilla collector: IAM database login only to the instances it monitors"
+      expression  = "resource.type == \"sqladmin.googleapis.com/Instance\" && (${local.login_condition})"
+    }
+  }
 }
 
 # --- secrets ----------------------------------------------------------------

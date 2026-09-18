@@ -175,6 +175,7 @@ func gcpCmd(t *testing.T) *cobra.Command {
 	c.Flags().String("deploy-service-account", "projects/acme-prod/serviceAccounts/deployer@acme-prod.iam.gserviceaccount.com", "")
 	c.Flags().String("network", "", "")
 	c.Flags().String("subnetwork", "", "")
+	c.Flags().Bool("allow-project-wide-login", false, "")
 	c.SetContext(context.Background())
 	return c
 }
@@ -191,6 +192,23 @@ func completeGcpTarget() collector.GcpTarget {
 		Host:         "abc.us-central1.sql-psa.goog.",
 		Port:         5432,
 		ServerCaMode: "GOOGLE_MANAGED_CAS_CA",
+		IamEnabled:   true,
+		Network:      "projects/acme-prod/global/networks/default",
+		Replicas:     []string{"prod-pg-replica"},
+	}
+}
+
+// alloyDBGcpTarget is a discovered AlloyDB cluster with its primary.
+func alloyDBGcpTarget() collector.GcpTarget {
+	return collector.GcpTarget{
+		ProviderType: "alloydb",
+		Project:      "acme-prod",
+		Region:       "us-central1",
+		ClusterID:    "orders",
+		InstanceID:   "orders-primary",
+		Engine:       "postgres",
+		Host:         "10.0.0.5",
+		Port:         5432,
 		IamEnabled:   true,
 		Network:      "projects/acme-prod/global/networks/default",
 	}
@@ -257,6 +275,15 @@ func TestRunInstallGCP_HappyPath(t *testing.T) {
 	if !strings.Contains(d.Inputs["collector_image"], "@sha256:") {
 		t.Errorf("image should be pinned, got %s", d.Inputs["collector_image"])
 	}
+	// The IAM grants are Cloud SQL's only, with login conditioned on the
+	// primary and its replica — and the scope is said out loud.
+	if d.Inputs["login_instances"] != "prod-pg,prod-pg-replica" || d.Inputs["cloud_sql_roles"] != "true" || d.Inputs["alloydb_roles"] != "false" {
+		t.Errorf("IAM inputs = login_instances=%q cloud_sql_roles=%q alloydb_roles=%q",
+			d.Inputs["login_instances"], d.Inputs["cloud_sql_roles"], d.Inputs["alloydb_roles"])
+	}
+	if !strings.Contains(out, "IAM database login scoped to prod-pg, prod-pg-replica") {
+		t.Errorf("the login scope should be printed, got:\n%s", out)
+	}
 	// State is saved before the slow deploy.
 	st, lerr := collector.LoadState()
 	if lerr != nil || st == nil {
@@ -277,6 +304,72 @@ func TestRunInstallGCP_HappyPath(t *testing.T) {
 	if !strings.Contains(out, "dbg collector status") {
 		t.Errorf("the operator should be pointed at status to confirm the connection, got:\n%s", out)
 	}
+}
+
+// Where the collector's IAM database login reaches is said out loud: scoped
+// by default, project-wide only by explicit opt-out, and project-wide on
+// AlloyDB because nothing can narrow it there.
+func TestRunInstallGCP_LoginScope(t *testing.T) {
+	setup := func(t *testing.T, target collector.GcpTarget) (*cobra.Command, *gcpDeployCall) {
+		t.Helper()
+		isolate(t)
+		writeTokens(t)
+		stubGCPOK(t)
+		stubGcpDiscover(t, target, nil)
+		deploys := stubGcpDeploy(t, nil)
+		srv := installServer(t, "agent-gcp")
+		t.Cleanup(srv.Close)
+		c := gcpCmd(t)
+		mustSet(t, c, "api-url", srv.URL)
+		mustSet(t, c, "yes", "true")
+		return c, deploys
+	}
+	t.Run("opt-out widens the login and warns", func(t *testing.T) {
+		c, deploys := setup(t, completeGcpTarget())
+		mustSet(t, c, "allow-project-wide-login", "true")
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if got := deploys.deploy.Inputs["login_instances"]; got != "" {
+			t.Errorf("login_instances = %q, want empty", got)
+		}
+		if deploys.deploy.Inputs["cloud_sql_roles"] != "true" {
+			t.Error("the opt-out widens the login; it does not drop the roles")
+		}
+		if !strings.Contains(out, "--allow-project-wide-login") || !strings.Contains(out, "any Cloud SQL instance in project acme-prod") {
+			t.Errorf("the opt-out must be warned about, got:\n%s", out)
+		}
+	})
+	t.Run("alloydb is project-wide and says so", func(t *testing.T) {
+		c, deploys := setup(t, alloyDBGcpTarget())
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		in := deploys.deploy.Inputs
+		if in["alloydb_roles"] != "true" || in["cloud_sql_roles"] != "false" || in["login_instances"] != "" {
+			t.Errorf("IAM inputs = login_instances=%q cloud_sql_roles=%q alloydb_roles=%q",
+				in["login_instances"], in["cloud_sql_roles"], in["alloydb_roles"])
+		}
+		if !strings.Contains(out, "AlloyDB IAM login cannot be scoped") || strings.Contains(out, "login scoped to") {
+			t.Errorf("AlloyDB's project-wide login must be warned about, got:\n%s", out)
+		}
+	})
+	t.Run("dry run shows the scope", func(t *testing.T) {
+		c, _ := setup(t, completeGcpTarget())
+		mustSet(t, c, "dry-run", "true")
+		var err error
+		out := capture(t, func() { err = runInstallGCP(c) })
+		if err != nil {
+			t.Fatalf("runInstallGCP: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "login_instances = prod-pg,prod-pg-replica") {
+			t.Errorf("the dry run should show the condition's instances, got:\n%s", out)
+		}
+	})
 }
 
 func TestRunInstallGCP_DryRunMintsNothing(t *testing.T) {

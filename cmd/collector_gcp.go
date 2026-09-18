@@ -55,6 +55,7 @@ func init() {
 	installCmd.Flags().String("deploy-service-account", "", "GCP: service account Infrastructure Manager actuates Terraform as (projects/<project>/serviceAccounts/<email>)")
 	installCmd.Flags().String("network", "", "GCP: VPC for the collector instance, as projects/<project>/global/networks/<name> (discovered from the database when omitted). The VPC needs egress to the internet (Cloud NAT) for the image pull and the DBGorilla connection")
 	installCmd.Flags().String("subnetwork", "", "GCP: subnetwork for the collector instance (auto-selected when the VPC has exactly one in the database's region; required otherwise)")
+	installCmd.Flags().Bool("allow-project-wide-login", false, "GCP: let the collector's service account use IAM database login on every Cloud SQL instance in the project, not only the monitored instance and its read replicas (drops the IAM Condition on roles/cloudsql.instanceUser)")
 }
 
 // runInstallGCP deploys the collector to a Compute Engine managed instance
@@ -170,19 +171,22 @@ func runInstallGCP(cmd *cobra.Command) error {
 
 	targets := []collector.GcpTarget{target}
 	commandsEnabled := resolveCommands(cmd, targets, gcpTargetLabel)
+	allowProjectWideLogin, _ := cmd.Flags().GetBool("allow-project-wide-login")
+	printGcpLoginScope(targets, allowProjectWideLogin, project)
 
 	if dryRun {
 		image, _ := resolveImage(cmd, nil)
 		inputs, err := collector.GcpDeployInputs(collector.GcpStackInput{
 			AgentID: "DRY-RUN", TenantID: "DRY-RUN",
-			Image:           image,
-			Targets:         targets,
-			Network:         network,
-			Subnetwork:      subnetwork,
-			Region:          target.Region,
-			DeploymentName:  deploymentName,
-			Project:         project,
-			CommandsEnabled: commandsEnabled,
+			Image:                 image,
+			Targets:               targets,
+			Network:               network,
+			Subnetwork:            subnetwork,
+			Region:                target.Region,
+			DeploymentName:        deploymentName,
+			Project:               project,
+			CommandsEnabled:       commandsEnabled,
+			AllowProjectWideLogin: allowProjectWideLogin,
 		})
 		if err != nil {
 			return err
@@ -208,17 +212,18 @@ func runInstallGCP(cmd *cobra.Command) error {
 	fmt.Println(style.Success(fmt.Sprintf("✓ Collector image: %s (%s)", image, imageSource)))
 
 	inputs, err := collector.GcpDeployInputs(collector.GcpStackInput{
-		AgentID:         creds.AgentID,
-		TenantID:        creds.TenantID,
-		Image:           image,
-		Endpoints:       endpointsFor(creds, cmd),
-		Targets:         targets,
-		Network:         network,
-		Subnetwork:      subnetwork,
-		Region:          target.Region,
-		DeploymentName:  deploymentName,
-		Project:         project,
-		CommandsEnabled: commandsEnabled,
+		AgentID:               creds.AgentID,
+		TenantID:              creds.TenantID,
+		Image:                 image,
+		Endpoints:             endpointsFor(creds, cmd),
+		Targets:               targets,
+		Network:               network,
+		Subnetwork:            subnetwork,
+		Region:                target.Region,
+		DeploymentName:        deploymentName,
+		Project:               project,
+		CommandsEnabled:       commandsEnabled,
+		AllowProjectWideLogin: allowProjectWideLogin,
 	})
 	if err != nil {
 		deprovisionOrWarn(client, creds.AgentID)
@@ -370,6 +375,32 @@ func resolveGcpAuth(target *collector.GcpTarget, dbPassword, deploymentName, pro
 	sa := collector.GcpRuntimeServiceAccountFor(deploymentName, project)
 	target.User = collector.GcpDatabaseUserFor(sa, target.Engine)
 	return nil
+}
+
+// printGcpLoginScope says how far the collector's IAM database login reaches.
+// The login roles bind on the project; on Cloud SQL an IAM Condition narrows
+// roles/cloudsql.instanceUser to the monitored instance and its replicas, and
+// dropping that is an explicit choice worth a warning. AlloyDB's login check
+// matches no resource name, so there is nothing to narrow — say so. Either
+// way the account only logs in where it has been registered as a database
+// user.
+func printGcpLoginScope(targets []collector.GcpTarget, allowProjectWide bool, project string) {
+	scoped := collector.GcpLoginInstances(targets)
+	switch {
+	case len(scoped) > 0 && allowProjectWide:
+		fmt.Println(style.Warn(fmt.Sprintf("⚠  --allow-project-wide-login: the collector's service account may use IAM login on "+
+			"any Cloud SQL instance in project %s that registers it as a user (no IAM Condition on roles/cloudsql.instanceUser)", project)))
+	case len(scoped) > 0:
+		fmt.Println(style.Success(fmt.Sprintf("✓ IAM database login scoped to %s (IAM Condition on roles/cloudsql.instanceUser)",
+			strings.Join(scoped, ", "))))
+	}
+	for _, t := range targets {
+		if t.ProviderType == "alloydb" {
+			fmt.Println(style.Warn(fmt.Sprintf("⚠  AlloyDB IAM login cannot be scoped by IAM Condition: the collector's service account may "+
+				"log in to any AlloyDB instance in project %s that registers it as a user (roles/alloydb.databaseUser is project-wide)", project)))
+			break
+		}
+	}
 }
 
 // printGcpGrantGuidance names the two grant steps IAM auth needs: registering

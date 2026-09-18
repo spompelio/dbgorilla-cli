@@ -218,6 +218,27 @@ func TestDiscoverGcpTarget_RefusesWhatTheCollectorCannotMonitor(t *testing.T) {
 	}
 }
 
+// The collector logs in to the primary's read replicas too, so discovery
+// names them for the IAM Condition that scopes its login. The API reports a
+// replica's masterInstanceName as "project:instance".
+func TestDiscoverGcpTarget_CloudSQLNamesItsReplicas(t *testing.T) {
+	stubGCP(t, newGCPFake(t).
+		on("GET", sqlListPath+"/prod-pg", 200, sqlInstanceJSON("prod-pg", "POSTGRES_16", "")).
+		on("GET", sqlListPath, 200, sqlInstancesJSON(
+			sqlInstanceJSON("prod-pg", "POSTGRES_16", ""),
+			sqlInstanceJSON("prod-pg-r2", "POSTGRES_16", "p:prod-pg"),
+			sqlInstanceJSON("prod-pg-r1", "POSTGRES_16", "prod-pg"),
+			sqlInstanceJSON("other-pg", "POSTGRES_16", ""),
+			sqlInstanceJSON("other-r", "POSTGRES_16", "p:other-pg"))))
+	got, err := DiscoverGcpTarget("prod-pg", "", GcpTarget{Project: "p"})
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if strings.Join(got.Replicas, ",") != "prod-pg-r1,prod-pg-r2" {
+		t.Fatalf("replicas = %v, want the primary's two, sorted", got.Replicas)
+	}
+}
+
 func TestDiscoverGcpTarget_NeedsAProject(t *testing.T) {
 	stubGCP(t, newGCPFake(t))
 	_, err := DiscoverGcpTarget("", "", GcpTarget{})

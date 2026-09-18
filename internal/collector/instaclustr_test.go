@@ -351,7 +351,7 @@ func TestGcpDeployInputsWithInstaclustrComponents(t *testing.T) {
 	if inputs["stable_egress"] != "true" || inputs["nat_subnet_cidr"] != "10.10.200.0/28" {
 		t.Fatalf("v1.3 inputs wrong: %v", inputs)
 	}
-	if inputs["database_roles"] != "false" {
+	if inputs["cloud_sql_roles"] != "false" || inputs["alloydb_roles"] != "false" || inputs["login_instances"] != "" {
 		t.Fatal("an instaclustr install must not grant the Cloud SQL / AlloyDB project-wide roles")
 	}
 	if inputs["instaclustr_api_key"] != "" {

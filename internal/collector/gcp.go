@@ -32,6 +32,11 @@ type GcpTarget struct {
 
 	Network string // VPC self-link the collector instance joins
 
+	// Replicas are the Cloud SQL read replicas of InstanceID (short ids),
+	// discovered from the primary. The collector logs in to them too, so the
+	// IAM Condition scoping its login names them alongside the primary.
+	Replicas []string
+
 	Databases  []string
 	User       string   // empty means DefaultDBUser
 	AuthMethod string   // "gcp_iam" (default) | "password"
@@ -230,13 +235,44 @@ func discoverCloudSQL(ctx context.Context, cfg gcpConfig, into GcpTarget, instan
 	if info.MasterInstanceName != "" {
 		return into, fmt.Errorf("Cloud SQL instance %q is a read replica of %q — "+
 			"pass the primary as --db-instance-id; the collector discovers replicas from it",
-			instance, info.MasterInstanceName)
+			instance, replicaPrimary(info.MasterInstanceName))
 	}
 	if !supportedCloudSQLEngine(info.DatabaseVersion) {
 		return into, fmt.Errorf("Cloud SQL instance %q runs %s, which this collector does not support "+
 			"(PostgreSQL and MySQL are supported)", instance, info.DatabaseVersion)
 	}
-	return mergeCloudSQLInstance(into, info), nil
+	target := mergeCloudSQLInstance(into, info)
+	replicas, err := listCloudSQLReplicas(ctx, cfg, into.Project, info.Name)
+	if err != nil {
+		return into, err
+	}
+	target.Replicas = replicas
+	return target, nil
+}
+
+// listCloudSQLReplicas names the read replicas of primary, in a stable order.
+func listCloudSQLReplicas(ctx context.Context, cfg gcpConfig, project, primary string) ([]string, error) {
+	all, err := listCloudSQLInstances(ctx, cfg, project)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, inst := range all {
+		if inst.MasterInstanceName != "" && replicaPrimary(inst.MasterInstanceName) == primary {
+			out = append(out, inst.Name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// replicaPrimary reduces a replica's masterInstanceName — the API reports it
+// as "project:instance" — to the instance id.
+func replicaPrimary(master string) string {
+	if _, after, ok := strings.Cut(master, ":"); ok {
+		return after
+	}
+	return master
 }
 
 // mergeCloudSQLInstance projects an instances.get response into the target.

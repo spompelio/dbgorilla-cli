@@ -13,10 +13,22 @@ variable "collector_image" {
   type        = string
 }
 
-variable "database_roles" {
-  description = "Grant the collector's service account the Cloud SQL / AlloyDB viewer, client and IAM-login roles. Off for sources that are not Google-managed databases (Instaclustr), where the project-wide grants would be pure excess."
+variable "cloud_sql_roles" {
+  description = "Grant the collector's service account the Cloud SQL viewer, client and IAM-login roles. On for a Cloud SQL target only: the grants are project-wide (login_instances narrows the login one)."
   type        = bool
   default     = true
+}
+
+variable "alloydb_roles" {
+  description = "Grant the collector's service account the AlloyDB viewer, client and IAM-login roles. On for an AlloyDB target only: the grants are project-wide, and AlloyDB's login role cannot be narrowed by an IAM Condition."
+  type        = bool
+  default     = false
+}
+
+variable "login_instances" {
+  description = "Cloud SQL instance ids (comma-separated) the collector's IAM database login is restricted to, as an IAM Condition on roles/cloudsql.instanceUser: the monitored instance and its read replicas. Empty grants login to every Cloud SQL instance in the project."
+  type        = string
+  default     = ""
 }
 
 variable "network" {

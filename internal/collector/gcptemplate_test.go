@@ -144,8 +144,12 @@ func TestGcpDeployInputs_RendersTheFullContract(t *testing.T) {
 	if strings.Join(keys, ",") != strings.Join(gcpInputKeys, ",") {
 		t.Fatalf("rendered inputs %v != contract %v", keys, gcpInputKeys)
 	}
-	if inputs["database_roles"] != "true" {
-		t.Fatal("a Cloud SQL install needs the database roles granted")
+	if inputs["cloud_sql_roles"] != "true" || inputs["alloydb_roles"] != "false" {
+		t.Fatalf("a Cloud SQL install grants the Cloud SQL roles and not AlloyDB's, got cloud_sql=%s alloydb=%s",
+			inputs["cloud_sql_roles"], inputs["alloydb_roles"])
+	}
+	if inputs["login_instances"] != "orders-pg" {
+		t.Fatalf("IAM login is scoped to the monitored instance, got login_instances=%q", inputs["login_instances"])
 	}
 	decoded, err := DecodeConfig(inputs["collector_config"])
 	if err != nil {
@@ -155,5 +159,71 @@ func TestGcpDeployInputs_RendersTheFullContract(t *testing.T) {
 	// script resolves from Secret Manager; GcpStackInput cannot carry one.
 	if !strings.Contains(decoded, "${DBG_SERVER_SECRET}") {
 		t.Fatalf("config must reference the secret env var:\n%s", decoded)
+	}
+}
+
+// The IAM Condition names every instance the collector logs in to; the
+// opt-out and AlloyDB (whose login cannot be conditioned) leave it empty.
+func TestGcpDeployInputs_LoginScope(t *testing.T) {
+	render := func(t *testing.T, in GcpStackInput) map[string]string {
+		t.Helper()
+		in.AgentID, in.TenantID, in.Image = "a", "t", "img"
+		in.Network, in.Region, in.DeploymentName, in.Project =
+			"projects/p/global/networks/default", "us-central1", "dbgorilla-collector", "p"
+		inputs, err := GcpDeployInputs(in)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		return inputs
+	}
+	cloudSQL := GcpTarget{ProviderType: "cloud_sql", Project: "p", Region: "us-central1", InstanceID: "orders-pg",
+		Replicas: []string{"orders-pg-r1", "orders-pg-r2"}, Engine: "postgres", Host: "h.", Port: 5432, AuthMethod: "gcp_iam", User: "u"}
+	alloy := GcpTarget{ProviderType: "alloydb", Project: "p", Region: "us-central1", ClusterID: "orders", InstanceID: "orders-primary",
+		Engine: "postgres", Host: "10.0.0.5", Port: 5432, AuthMethod: "gcp_iam", User: "u"}
+
+	t.Run("primary and replicas", func(t *testing.T) {
+		inputs := render(t, GcpStackInput{Targets: []GcpTarget{cloudSQL}})
+		if inputs["login_instances"] != "orders-pg,orders-pg-r1,orders-pg-r2" {
+			t.Errorf("login_instances = %q", inputs["login_instances"])
+		}
+	})
+	t.Run("opt-out drops the condition, not the roles", func(t *testing.T) {
+		inputs := render(t, GcpStackInput{Targets: []GcpTarget{cloudSQL}, AllowProjectWideLogin: true})
+		if inputs["login_instances"] != "" || inputs["cloud_sql_roles"] != "true" {
+			t.Errorf("login_instances = %q, cloud_sql_roles = %q", inputs["login_instances"], inputs["cloud_sql_roles"])
+		}
+	})
+	t.Run("alloydb grants its own roles, unconditioned", func(t *testing.T) {
+		inputs := render(t, GcpStackInput{Targets: []GcpTarget{alloy}})
+		if inputs["alloydb_roles"] != "true" || inputs["cloud_sql_roles"] != "false" || inputs["login_instances"] != "" {
+			t.Errorf("cloud_sql_roles=%s alloydb_roles=%s login_instances=%q",
+				inputs["cloud_sql_roles"], inputs["alloydb_roles"], inputs["login_instances"])
+		}
+	})
+}
+
+// What the template does with login_instances: an IAM Condition on the Cloud
+// SQL login role only, in the resource form Cloud SQL enforces; and the roles
+// gated per service.
+func TestGcpTemplateContract_LoginCondition(t *testing.T) {
+	raw, err := os.ReadFile("terraform/collector-gce/main.tf")
+	if err != nil {
+		t.Fatalf("read template: %v", err)
+	}
+	main := regexp.MustCompile(` +`).ReplaceAllString(string(raw), " ")
+	for _, want := range []string{
+		`compact(split(",", var.login_instances))`,
+		`resource.name == \"projects/${local.project}/instances/${i}\"`,
+		`for_each = each.value == "roles/cloudsql.instanceUser" && length(local.login_instances) > 0 ? [1] : []`,
+		`expression = "resource.type == \"sqladmin.googleapis.com/Instance\" && (${local.login_condition})"`,
+		`var.cloud_sql_roles ? [`,
+		`var.alloydb_roles ? [`,
+	} {
+		if !strings.Contains(main, want) {
+			t.Errorf("main.tf must contain %q", want)
+		}
+	}
+	if strings.Contains(main, "database_roles") {
+		t.Error("database_roles was replaced by the per-service gates")
 	}
 }

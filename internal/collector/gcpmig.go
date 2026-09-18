@@ -37,9 +37,16 @@ var (
 // out; the group converges regardless.
 var ErrGcpMigRolling = errors.New("instance group still rolling")
 
-// WaitGcpMigStable waits until the group reports no pending action on its
-// instances — after an update or upgrade, that the instance runs the new
-// template. A stopped group (size 0) is stable at once.
+// migSettledReadings is how many consecutive settled readings a rollout must
+// show before it counts as done. The group reports stable for a moment
+// after Terraform sets its new template and before its updater picks the
+// change up (observed live), so one reading proves nothing.
+const migSettledReadings = 3
+
+// WaitGcpMigStable waits until the group's instances all run its target
+// template and no action is pending — after an update or upgrade, that the
+// instance was recreated on the new one. A stopped group (size 0) settles at
+// once.
 func WaitGcpMigStable(project, region, deploymentName string) error {
 	ctx := context.Background()
 	cfg, err := loadGCPConfig(ctx)
@@ -47,17 +54,25 @@ func WaitGcpMigStable(project, region, deploymentName string) error {
 		return gcpCredsErr(err)
 	}
 	deadline := time.Now().Add(computeOpTimeout)
+	settled := 0
 	for {
 		var mig struct {
 			Status struct {
-				IsStable bool `json:"isStable"`
+				IsStable      bool `json:"isStable"`
+				VersionTarget struct {
+					IsReached bool `json:"isReached"`
+				} `json:"versionTarget"`
 			} `json:"status"`
 		}
 		if err := gcpDo(ctx, cfg, http.MethodGet, migPath(project, region, deploymentName), nil, &mig); err != nil {
 			return fmt.Errorf("could not read collector group %q: %w", deploymentName, err)
 		}
-		if mig.Status.IsStable {
-			return nil
+		if mig.Status.IsStable && mig.Status.VersionTarget.IsReached {
+			if settled++; settled >= migSettledReadings {
+				return nil
+			}
+		} else {
+			settled = 0
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("%w after %s", ErrGcpMigRolling, computeOpTimeout)

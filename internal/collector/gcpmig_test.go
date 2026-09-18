@@ -128,16 +128,24 @@ func TestTailGcpLogs_StoppedGroupPointsAtStart(t *testing.T) {
 	}
 }
 
-func TestWaitGcpMigStable_PollsUntilStable(t *testing.T) {
+func TestWaitGcpMigStable_PollsUntilSettled(t *testing.T) {
+	const rolling = `{"status":{"isStable":false,"versionTarget":{"isReached":false}}}`
+	const settled = `{"status":{"isStable":true,"versionTarget":{"isReached":true}}}`
+	// Stable for a moment before the updater starts, then rolling, then
+	// settled — which has to hold for several readings.
 	f := newGCPFake(t).onSeq("GET", migBase,
-		gcpFakeResp{200, `{"status":{"isStable":false}}`},
-		gcpFakeResp{200, `{"status":{"isStable":true}}`})
+		gcpFakeResp{200, settled},
+		gcpFakeResp{200, rolling},
+		gcpFakeResp{200, `{"status":{"isStable":true,"versionTarget":{"isReached":false}}}`},
+		gcpFakeResp{200, settled},
+		gcpFakeResp{200, settled},
+		gcpFakeResp{200, settled})
 	stubGCP(t, f)
 	if err := WaitGcpMigStable("p", "us-central1", "dbg"); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if f.called("GET", migBase) != 2 {
-		t.Errorf("polled %d times, want 2", f.called("GET", migBase))
+	if got := f.called("GET", migBase); got != 6 {
+		t.Errorf("polled %d times, want 6 (a lone stable reading must not end the wait)", got)
 	}
 }
 
@@ -145,7 +153,7 @@ func TestWaitGcpMigStable_BudgetRunsOutAsStillRolling(t *testing.T) {
 	orig := computeOpTimeout
 	computeOpTimeout = 0
 	t.Cleanup(func() { computeOpTimeout = orig })
-	stubGCP(t, newGCPFake(t).on("GET", migBase, 200, `{"status":{"isStable":false}}`))
+	stubGCP(t, newGCPFake(t).on("GET", migBase, 200, `{"status":{"isStable":false,"versionTarget":{"isReached":false}}}`))
 	err := WaitGcpMigStable("p", "us-central1", "dbg")
 	if !errors.Is(err, ErrGcpMigRolling) {
 		t.Fatalf("err = %v, want ErrGcpMigRolling", err)

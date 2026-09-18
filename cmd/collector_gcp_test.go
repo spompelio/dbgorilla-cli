@@ -1520,8 +1520,9 @@ func TestRunUpdateGCP_FailuresRollNothingBack(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, deploys := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4"), completeGcpTarget())
-			stubGcpDeploy(t, tc.deploy)
+			c, _ := setupGcpUpdate(t, deployedGcpSpec(t, storedGcpConfig(t, installedGcpTarget()), "v1.4"), completeGcpTarget())
+			// The failing deploy's recorder is the one in effect during the run.
+			deploys := stubGcpDeploy(t, tc.deploy)
 			deleted := stubDeleteGcpDeployment(t, nil)
 			var err error
 			out := capture(t, func() { err = runInstallGCP(c) })
